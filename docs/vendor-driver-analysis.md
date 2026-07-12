@@ -107,3 +107,20 @@ Live validation of step 1 against a power-on Rev. 2 device returned a USB I/O
 error. The device remained healthy and enumerated normally. Static call context
 therefore does not yet include an earlier prerequisite that enables this register
 transport; no startup write has been attempted.
+
+Further caller analysis established that object field `0x69c0` represents the
+selected input mode rather than hardware revision. Input mode 4 selects the
+compact HDMI initializer containing the `0x98` sequence. Other modes enter a
+larger MST3367 tuning path.
+
+The same generic register transport services bank `0x9c` and others. Its normal
+one-byte write framing is:
+
+- class-interface OUT;
+- `bRequest = 0xc0`;
+- `wValue = register bank/device`;
+- `wIndex = register address`;
+- one-byte transfer payload.
+
+The matching read uses class-interface IN with the same request/value/index
+layout. The PnP-time operation that enables this transport remains unidentified.

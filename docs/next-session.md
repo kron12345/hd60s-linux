@@ -57,7 +57,7 @@ volatile. Stop and document ambiguity instead of testing unknown writes.
 The user must run:
 
 ```bash
-sudo pacman -S --needed qemu-desktop edk2-ovmf swtpm
+sudo pacman -S --needed qemu-desktop edk2-ovmf swtpm wireshark-cli
 ```
 
 Obtain an official Windows 10 or 11 ISO and record its absolute path. QEMU and a
@@ -105,4 +105,3 @@ sed -n '1,240p' docs/protocol.md
 sed -n '1,260p' docs/vendor-driver-analysis.md
 sed -n '1,220p' docs/obs.md
 ```
-
