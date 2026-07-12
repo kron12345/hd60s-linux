@@ -1,0 +1,2 @@
+# Original Elgato Game Capture HD60 S; grant access to the active local session.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="005e", TAG+="uaccess"

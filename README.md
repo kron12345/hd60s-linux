@@ -30,6 +30,15 @@ interactive desktop user access rather than making it world writable:
 SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="005e", TAG+="uaccess"
 ```
 
+Install the included rule and reconnect the device:
+
+```bash
+sudo install -Dm644 udev/70-hd60s-linux.rules \
+  /etc/udev/rules.d/70-hd60s-linux.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=usb
+```
+
 ## Intended architecture
 
 ```text
@@ -58,4 +67,3 @@ publication.
 ## License
 
 MIT
-
