@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: $0 OUTPUT.pcapng [SECONDS]" >&2
+  exit 2
+}
+
+[[ $# -ge 1 && $# -le 2 ]] || usage
+readonly output="$1"
+readonly seconds="${2:-60}"
+[[ "$seconds" =~ ^[1-9][0-9]*$ ]] || usage
+[[ ! -e "$output" ]] || { echo "error: refusing to overwrite $output" >&2; exit 1; }
+
+command -v dumpcap >/dev/null || {
+  echo 'error: dumpcap is required (Arch package: wireshark-cli)' >&2
+  exit 1
+}
+
+device=''
+for candidate in /sys/bus/usb/devices/*; do
+  [[ -r "$candidate/idVendor" && -r "$candidate/idProduct" ]] || continue
+  [[ "$(<"$candidate/idVendor")" == 0fd9 && "$(<"$candidate/idProduct")" == 005e ]] || continue
+  device="$candidate"
+  break
+done
+[[ -n "$device" ]] || { echo 'error: HD60 S 0fd9:005e is not connected' >&2; exit 1; }
+
+readonly bus="$((10#$(<"$device/busnum")))"
+readonly address="$((10#$(<"$device/devnum")))"
+readonly interface="usbmon$bus"
+
+if ! dumpcap -D 2>/dev/null | grep -qE "[[:space:]]$interface([[:space:]]|$)"; then
+  echo "error: $interface is unavailable" >&2
+  echo 'load usbmon and grant dumpcap capture permission before retrying' >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$output")"
+printf 'Capturing USB bus %d (current HD60 S address %d) for %d seconds to %s\n' \
+  "$bus" "$address" "$seconds" "$output" >&2
+printf 'Start the guest driver action now. Device address changes are expected on reset.\n' >&2
+
+timeout --signal=INT --kill-after=3 "$seconds" \
+  dumpcap -q -i "$interface" -s 0 -w "$output" || status=$?
+status="${status:-0}"
+[[ "$status" -eq 0 || "$status" -eq 124 ]] || exit "$status"
+[[ -s "$output" ]] || { echo 'error: capture file is empty' >&2; exit 1; }
+
+printf 'Capture complete. Raw traces are private and ignored by Git.\n' >&2
+

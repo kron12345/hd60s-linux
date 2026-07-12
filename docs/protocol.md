@@ -40,6 +40,11 @@ only when a trace or repeatable experiment supports them.
   alternate setting change completed normally and the local capture was empty.
 - Together, the endpoint observations indicate that a host control sequence must
   arm notifications and streaming before either endpoint becomes active.
+- A reconstructed read-only class-interface request for bank `0x0098`, register
+  `0x003b` was attempted with a one-second libusb timeout. The power-on device
+  rejected it with an I/O error and continued to enumerate normally afterward.
+  This indicates that an earlier volatile enable sequence is required before the
+  normal startup register sequence documented by the Windows driver can run.
 
 ## Trace experiment matrix
 

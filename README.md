@@ -29,6 +29,16 @@ Perform a bounded read of the advertised bulk stream alternate setting:
 cargo run -- observe-stream 10
 ```
 
+Read the first confirmed volatile startup status register without writing:
+
+```bash
+cargo run -- status
+```
+
+On a power-on Rev. 2 device this currently returns a USB I/O error, confirming
+that an earlier volatile enable sequence is required. The command remains a
+bounded protocol diagnostic, not a working signal-status query.
+
 Run tests with:
 
 ```bash
@@ -74,6 +84,8 @@ Reproducible facts from the official Windows driver are recorded in
 [docs/vendor-driver-analysis.md](docs/vendor-driver-analysis.md).
 The exact continuation state and next-session checklist are in
 [docs/next-session.md](docs/next-session.md).
+The QEMU host-side USB capture and sanitization workflow is documented in
+[docs/tracing.md](docs/tracing.md).
 
 ## Legal and safety boundaries
 

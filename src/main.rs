@@ -2,10 +2,15 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use std::{fs::File, io::Write};
 
-use rusb::{Context, Device, DeviceDescriptor, Direction, TransferType, UsbContext};
+use rusb::{
+    Context, Device, DeviceDescriptor, Direction, Recipient, RequestType, TransferType, UsbContext,
+};
 
 const ELGATO_VENDOR_ID: u16 = 0x0fd9;
 const HD60S_PRODUCT_ID: u16 = 0x005e;
+const REGISTER_REQUEST: u8 = 0xc0;
+const HDMI_REGISTER_BANK: u16 = 0x0098;
+const STARTUP_STATUS_REGISTER: u16 = 0x003b;
 
 fn transfer_name(transfer_type: TransferType) -> &'static str {
     match transfer_type {
@@ -178,10 +183,44 @@ fn observe_stream<T: UsbContext>(device: Device<T>, seconds: u64) -> Result<(), 
     Ok(())
 }
 
+fn read_startup_status<T: UsbContext>(device: Device<T>) -> Result<(), String> {
+    let handle = device
+        .open()
+        .map_err(|error| format!("opening device: {error}"))?;
+    handle
+        .claim_interface(0)
+        .map_err(|error| format!("claiming interface 0: {error}"))?;
+
+    let request_type = rusb::request_type(Direction::In, RequestType::Class, Recipient::Interface);
+    let mut response = [0_u8; 1];
+    let length = handle
+        .read_control(
+            request_type,
+            REGISTER_REQUEST,
+            HDMI_REGISTER_BANK,
+            STARTUP_STATUS_REGISTER,
+            &mut response,
+            Duration::from_secs(1),
+        )
+        .map_err(|error| format!("reading startup status register: {error}"))?;
+    if length != response.len() {
+        return Err(format!(
+            "startup status returned {length} byte(s), expected 1"
+        ));
+    }
+
+    println!(
+        "class-interface IN request=0x{REGISTER_REQUEST:02x} value=0x{HDMI_REGISTER_BANK:04x} index=0x{STARTUP_STATUS_REGISTER:04x}: 0x{:02x}",
+        response[0]
+    );
+    Ok(())
+}
+
 enum Operation {
     Inspect,
     ObserveInterrupt(u64),
     ObserveStream(u64),
+    Status,
 }
 
 fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
@@ -202,6 +241,7 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
                         .map_err(|error| format!("observing HD60 S interrupt endpoint: {error}"));
                 }
                 Operation::ObserveStream(seconds) => return observe_stream(device, seconds),
+                Operation::Status => return read_startup_status(device),
                 Operation::Inspect => {}
             }
             return inspect_device(device, descriptor, show_serial)
@@ -228,12 +268,13 @@ fn main() -> ExitCode {
     let operation = match arguments.first().map(String::as_str) {
         Some("observe") => seconds().map(Operation::ObserveInterrupt),
         Some("observe-stream") => seconds().map(Operation::ObserveStream),
+        Some("status") => Ok(Operation::Status),
         _ => Ok(Operation::Inspect),
     };
     let operation = match operation {
         Ok(operation) => operation,
         Err(_) => {
-            eprintln!("error: usage: hd60s-linux [observe|observe-stream] [SECONDS]");
+            eprintln!("error: usage: hd60s-linux [status|observe|observe-stream] [SECONDS]");
             return ExitCode::FAILURE;
         }
     };
@@ -256,5 +297,16 @@ mod tests {
         assert_eq!(transfer_name(TransferType::Isochronous), "isochronous");
         assert_eq!(direction_name(Direction::In), "in");
         assert_eq!(direction_name(Direction::Out), "out");
+    }
+
+    #[test]
+    fn startup_status_is_a_class_interface_read() {
+        assert_eq!(
+            rusb::request_type(Direction::In, RequestType::Class, Recipient::Interface),
+            0xa1
+        );
+        assert_eq!(REGISTER_REQUEST, 0xc0);
+        assert_eq!(HDMI_REGISTER_BANK, 0x0098);
+        assert_eq!(STARTUP_STATUS_REGISTER, 0x003b);
     }
 }

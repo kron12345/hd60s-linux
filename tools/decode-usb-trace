@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: $0 INPUT.pcapng OUTPUT.tsv" >&2
+  exit 2
+}
+
+[[ $# -eq 2 ]] || usage
+readonly input="$1"
+readonly output="$2"
+[[ -r "$input" ]] || { echo "error: cannot read $input" >&2; exit 1; }
+[[ ! -e "$output" ]] || { echo "error: refusing to overwrite $output" >&2; exit 1; }
+command -v tshark >/dev/null || {
+  echo 'error: tshark is required (Arch package: wireshark-cli)' >&2
+  exit 1
+}
+
+# Export class-interface setup packets and endpoint 0x81/0x83 traffic only.
+# Standard descriptor requests are deliberately excluded to avoid serial strings.
+readonly filter='(usb.bmRequestType.type == 1 && usb.bmRequestType.recipient == 1) || usb.endpoint_address == 0x81 || usb.endpoint_address == 0x83'
+
+{
+  printf 'frame\ttime\turb_type\ttransfer_type\tbus\taddress\tendpoint\tbmRequestType\tbRequest\twValue\twIndex\twLength\tdata_length\trequest_data\tresponse_data\n'
+  tshark -r "$input" -Y "$filter" -T fields \
+    -E header=n -E separator=$'\t' -E quote=n -E occurrence=f \
+    -e frame.number \
+    -e frame.time_relative \
+    -e usb.urb_type \
+    -e usb.transfer_type \
+    -e usb.bus_id \
+    -e usb.device_address \
+    -e usb.endpoint_address \
+    -e usb.bmRequestType \
+    -e usb.setup.bRequest \
+    -e usb.setup.wValue \
+    -e usb.setup.wIndex \
+    -e usb.setup.wLength \
+    -e usb.data_len \
+    -e usb.capdata \
+    -e usb.control.Response
+} > "$output"
+[[ -s "$output" ]] || { echo 'error: decoded output is empty' >&2; exit 1; }
+printf 'Decoded trace written to %s\n' "$output" >&2

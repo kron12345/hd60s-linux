@@ -83,3 +83,27 @@ initial live probes because their callers participate in sensitive operations:
 No request from those paths should be executed merely to test the transport.
 Normal capture traffic from the official driver is needed to identify a safe
 initialization subset.
+
+## Normal Rev. 2 startup register sequence
+
+The recognized Elgato device branch in `0x14022b7c0` skips the MCU-maintenance
+block and begins ordinary volatile register access. Its generic register helper
+uses class-interface request `0xc0`, `wValue` as the register bank/device, and
+`wIndex` as the register address.
+
+For product `005e`, the observed static sequence begins:
+
+1. read bank `0x0098`, register `0x003b`, one byte;
+2. conditionally write register `0x003b` based on internal capture mode;
+3. write register `0x0020` with byte `0x05`;
+4. write register `0x0000` with byte `0x01`;
+5. write register `0x0010` with byte `0xfe`.
+
+Only step 1 is implemented for live validation. The writes remain disabled until
+an official-driver trace confirms ordering, timing, and the mode-dependent value
+for register `0x003b`.
+
+Live validation of step 1 against a power-on Rev. 2 device returned a USB I/O
+error. The device remained healthy and enumerated normally. Static call context
+therefore does not yet include an earlier prerequisite that enables this register
+transport; no startup write has been attempted.
