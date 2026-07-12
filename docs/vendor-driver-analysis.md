@@ -53,3 +53,33 @@ The next static-analysis task is to identify the lower-level USB request helper
 called from the device initialization path, then express observed requests as a
 new protocol description rather than copying driver code.
 
+## Class-interface transfer layout
+
+Static analysis identified the shared transfer constructor at `0x14025f9dc`.
+For the exact driver hash above, it allocates an `0x88`-byte URB and sets:
+
+- URB function `0x17` (`URB_FUNCTION_CLASS_INTERFACE`);
+- transfer direction from an internal read/write argument;
+- transfer buffer length and pointer;
+- request byte at URB offset `0x81`;
+- value at offset `0x82`;
+- index at offset `0x84`.
+
+This establishes that the device protocol uses USB class-interface control
+requests, despite exposing vendor-specific interfaces.
+
+## Read candidates rejected for live testing
+
+The following read paths are structurally understood but are not suitable as
+initial live probes because their callers participate in sensitive operations:
+
+- request `0xc1`, value `0x0039`, index 0, length 1 is part of a bit-banged
+  internal-register transaction surrounded by multiple writes;
+- request `0xa0` is used for EEPROM reads;
+- request `0xa6` is used for debug/board-memory reads;
+- generic reads in the `0x14025a294` family participate in MCU presence and
+  firmware verification.
+
+No request from those paths should be executed merely to test the transport.
+Normal capture traffic from the official driver is needed to identify a safe
+initialization subset.
