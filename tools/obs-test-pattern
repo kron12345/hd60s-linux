@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+command -v ffmpeg >/dev/null || {
+  echo 'error: ffmpeg is required' >&2
+  exit 1
+}
+
+readonly URL="${HD60S_OBS_URL:-udp://127.0.0.1:5000?pkt_size=1316}"
+duration_args=()
+if [[ -n "${HD60S_TEST_DURATION:-}" ]]; then
+  duration_args=(-t "$HD60S_TEST_DURATION")
+fi
+
+echo "Sending 1080p60 test video and 48 kHz audio to $URL" >&2
+exec ffmpeg -hide_banner -loglevel warning -re \
+  -f lavfi -i 'testsrc2=size=1920x1080:rate=60' \
+  -f lavfi -i 'sine=frequency=1000:sample_rate=48000' \
+  -map 0:v:0 -map 1:a:0 \
+  -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p \
+  -g 120 -keyint_min 120 -sc_threshold 0 -bf 0 -b:v 8M \
+  -c:a aac -b:a 192k -ar 48000 -ac 2 \
+  "${duration_args[@]}" -f mpegts "$URL"

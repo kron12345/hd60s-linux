@@ -25,6 +25,7 @@ fn direction_name(direction: Direction) -> &'static str {
 fn inspect_device<T: UsbContext>(
     device: Device<T>,
     descriptor: DeviceDescriptor,
+    show_serial: bool,
 ) -> rusb::Result<()> {
     println!(
         "HD60 S {:04x}:{:04x} at bus {:03} address {:03}",
@@ -48,7 +49,9 @@ fn inspect_device<T: UsbContext>(
             if let Ok(value) = handle.read_product_string(language, &descriptor, timeout) {
                 println!("product: {value}");
             }
-            if let Ok(value) = handle.read_serial_number_string(language, &descriptor, timeout) {
+            if show_serial
+                && let Ok(value) = handle.read_serial_number_string(language, &descriptor, timeout)
+            {
                 println!("serial: {value}");
             }
         }
@@ -91,7 +94,7 @@ fn inspect_device<T: UsbContext>(
     Ok(())
 }
 
-fn run() -> Result<(), String> {
+fn run(show_serial: bool) -> Result<(), String> {
     let context = Context::new().map_err(|error| format!("initializing libusb: {error}"))?;
     let devices = context
         .devices()
@@ -103,7 +106,7 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("reading a USB device descriptor: {error}"))?;
         if descriptor.vendor_id() == ELGATO_VENDOR_ID && descriptor.product_id() == HD60S_PRODUCT_ID
         {
-            return inspect_device(device, descriptor)
+            return inspect_device(device, descriptor, show_serial)
                 .map_err(|error| format!("inspecting HD60 S: {error}"));
         }
     }
@@ -115,7 +118,10 @@ fn run() -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    match run() {
+    let show_serial = std::env::args()
+        .skip(1)
+        .any(|argument| argument == "--show-serial");
+    match run(show_serial) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
