@@ -10,6 +10,7 @@ endpoint `0x83`, and feed the existing localhost MPEG-TS transport into OBS.
 
 - Repository: `https://github.com/Hydrogen2K/hd60s-linux`
 - Local checkout: `/home/hayden/hd60s-linux`
+- Latest completed commit before this handoff update: `83beebf`.
 - Branch: `main`, clean and tracking `origin/main`
 - Device: Elgato HD60 S Rev. 2, USB `0fd9:005e`, device version `25.4.15`
 - Installed probe: `/home/hayden/.local/bin/hd60s-linux`
@@ -23,6 +24,14 @@ endpoint `0x83`, and feed the existing localhost MPEG-TS transport into OBS.
 - The official Elgato standalone driver was downloaded and extracted locally
   under ignored `research/` directories. Do not commit these binaries.
 - A local ignored Rizin toolchain is available under `research/tools/`.
+- QEMU, `tshark`, KVM access, and a Windows ISO were still absent at the final
+  prerequisite audit.
+- Host usbmon capture and sanitized TSV decoding scripts now exist as
+  `tools/capture-usbmon` and `tools/decode-usb-trace`.
+- The installed `status` command reconstructs the first normal HDMI register
+  read, but the power-on device rejects it with an I/O error. The card continues
+  to enumerate normally. This proves an earlier PnP-time volatile enable remains
+  missing; do not add writes to work around the stall.
 
 ## Verified protocol facts
 
@@ -35,6 +44,11 @@ endpoint `0x83`, and feed the existing localhost MPEG-TS transport into OBS.
 - The driver supports product IDs `004f`, `005e`, `0074`, and `0076`.
 - Driver and installer hashes and static-analysis anchors are recorded in
   `docs/vendor-driver-analysis.md`.
+- Normal register access uses class-interface request `0xc0`, with `wValue` as
+  the bank/device, `wIndex` as the register, and a one-byte payload.
+- Input mode 4 selects the compact HDMI initializer. Its statically recovered
+  bank `0x98` sequence begins with register `0x3b`, followed by writes to `0x20`,
+  `0x00`, and `0x10`; those writes remain intentionally disabled pending a trace.
 
 ## Safety boundary
 
@@ -65,27 +79,33 @@ Windows ISO were not present at the end of this session.
 
 ## Next steps
 
-1. Verify QEMU, OVMF, KVM access, the ISO path, free disk space, and USB access.
-2. Update `/home/hayden/hd60s-linux-bridge/hd60s-vm` if necessary and create a
+1. Implement a Rust analyzer for the sanitized TSV trace format. It must classify
+   known volatile bank `0x98`/`0x9c` register traffic, automatically redact
+   EEPROM/board-memory/MCU payloads, label unknown requests, summarize endpoint
+   `0x81`/`0x83` activity, and include synthetic golden tests that do not require
+   `tshark`.
+2. Verify QEMU, OVMF, KVM access, `tshark`, the ISO path, free disk space, and
+   USB access.
+3. Update `/home/hayden/hd60s-linux-bridge/hd60s-vm` if necessary and create a
    64 GiB Windows VM disk with USB passthrough for `0fd9:005e`.
-3. Install only the official standalone HD60 S driver in the guest first.
-4. Establish packet capture using QEMU USB tracing or a Windows USBPcap capture.
-5. Record and hash a baseline enumeration trace with HDMI disconnected.
-6. Record preview start/stop traces for 720p60, 1080p30, and 1080p60 SDR.
-7. Sanitize serial numbers and identifying fields before adding trace-derived
+4. Install only the official standalone HD60 S driver in the guest first.
+5. Establish host-side packet capture using Linux `usbmon` and `dumpcap`.
+6. Record and hash a baseline enumeration trace with HDMI disconnected.
+7. Record preview start/stop traces for 720p60, 1080p30, and 1080p60 SDR.
+8. Sanitize serial numbers and identifying fields before adding trace-derived
    fixtures. Never commit the raw driver or unsanitized capture.
-8. Diff enumeration, initialization, steady-state stream, and shutdown phases.
-9. Decode class-interface transfers into direction, request, value, index,
+9. Diff enumeration, initialization, steady-state stream, and shutdown phases.
+10. Decode class-interface transfers into direction, request, value, index,
    length, payload, response, repetition count, and timing.
-10. Classify each write as volatile capture configuration or prohibited
+11. Classify each write as volatile capture configuration or prohibited
     persistent/maintenance behavior.
-11. Implement the smallest confirmed read-only status subset in Rust with
+12. Implement the smallest confirmed read-only status subset in Rust with
     golden-fixture tests.
-12. Implement capture initialization one volatile stage at a time with bounded
+13. Implement capture initialization one volatile stage at a time with bounded
     timeouts, stage logs, and an external process timeout.
-13. Capture raw endpoint `0x83` data and identify framing or standard media
+14. Capture raw endpoint `0x83` data and identify framing or standard media
     signatures before adding a parser.
-14. Reconstruct H.264/AAC or raw video/audio, then send it through the already
+15. Reconstruct H.264/AAC or raw video/audio, then send it through the already
     validated MPEG-TS transport documented in `docs/obs.md`.
 
 ## Resume commands
