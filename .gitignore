@@ -2,4 +2,6 @@
 *.pcap
 *.pcapng
 *.bin
-
+/research/vendor/
+/research/tools/
+/research/extracted/

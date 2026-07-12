@@ -70,6 +70,8 @@ A kernel module would make early reverse engineering harder and failures riskier
 See [docs/protocol.md](docs/protocol.md) and [docs/roadmap.md](docs/roadmap.md).
 The provisional OBS transport and test procedure are in
 [docs/obs.md](docs/obs.md).
+Reproducible facts from the official Windows driver are recorded in
+[docs/vendor-driver-analysis.md](docs/vendor-driver-analysis.md).
 
 ## Legal and safety boundaries
 
