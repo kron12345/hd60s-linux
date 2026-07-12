@@ -1,5 +1,6 @@
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::{fs::File, io::Write};
 
 use rusb::{Context, Device, DeviceDescriptor, Direction, TransferType, UsbContext};
 
@@ -94,7 +95,96 @@ fn inspect_device<T: UsbContext>(
     Ok(())
 }
 
-fn run(show_serial: bool) -> Result<(), String> {
+fn observe_interrupt<T: UsbContext>(device: Device<T>, seconds: u64) -> rusb::Result<()> {
+    eprintln!("stage: opening device");
+    let handle = device.open()?;
+    eprintln!("stage: device open");
+    match handle.kernel_driver_active(1) {
+        Ok(active) => eprintln!("stage: interface 1 kernel driver active: {active}"),
+        Err(error) => eprintln!("stage: kernel-driver query unavailable: {error}"),
+    }
+    eprintln!("stage: claiming interface 1");
+    handle.claim_interface(1)?;
+    eprintln!("stage: interface 1 claimed");
+
+    let started = Instant::now();
+    let duration = Duration::from_secs(seconds);
+    let timeout = Duration::from_millis(200);
+    let mut buffer = [0_u8; 64];
+    let mut packets = 0_u64;
+
+    println!("observing interrupt endpoint 0x81 for {seconds} seconds");
+    while started.elapsed() < duration {
+        match handle.read_interrupt(0x81, &mut buffer, timeout) {
+            Ok(length) => {
+                packets += 1;
+                let hex = buffer[..length]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!(
+                    "{:>8.3}s  {:>2} bytes  {hex}",
+                    started.elapsed().as_secs_f64(),
+                    length
+                );
+            }
+            Err(rusb::Error::Timeout) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    println!("observation complete: {packets} packet(s)");
+    Ok(())
+}
+
+fn observe_stream<T: UsbContext>(device: Device<T>, seconds: u64) -> Result<(), String> {
+    eprintln!("stage: opening device");
+    let handle = device
+        .open()
+        .map_err(|error| format!("opening device: {error}"))?;
+    eprintln!("stage: claiming interface 0");
+    handle
+        .claim_interface(0)
+        .map_err(|error| format!("claiming interface 0: {error}"))?;
+    eprintln!("stage: selecting bulk alternate setting 4");
+    handle
+        .set_alternate_setting(0, 4)
+        .map_err(|error| format!("selecting interface 0 alternate setting 4: {error}"))?;
+
+    let path = "/tmp/hd60s-stream.bin";
+    let mut output = File::create(path).map_err(|error| format!("creating {path}: {error}"))?;
+    let started = Instant::now();
+    let duration = Duration::from_secs(seconds);
+    let timeout = Duration::from_millis(200);
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut bytes = 0_u64;
+    let mut transfers = 0_u64;
+
+    println!("observing bulk endpoint 0x83 for {seconds} seconds");
+    while started.elapsed() < duration {
+        match handle.read_bulk(0x83, &mut buffer, timeout) {
+            Ok(length) => {
+                output
+                    .write_all(&buffer[..length])
+                    .map_err(|error| format!("writing {path}: {error}"))?;
+                bytes += length as u64;
+                transfers += 1;
+            }
+            Err(rusb::Error::Timeout) => {}
+            Err(error) => return Err(format!("reading bulk endpoint 0x83: {error}")),
+        }
+    }
+    println!("observation complete: {transfers} transfer(s), {bytes} byte(s), output {path}");
+    Ok(())
+}
+
+enum Operation {
+    Inspect,
+    ObserveInterrupt(u64),
+    ObserveStream(u64),
+}
+
+fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
     let context = Context::new().map_err(|error| format!("initializing libusb: {error}"))?;
     let devices = context
         .devices()
@@ -106,6 +196,14 @@ fn run(show_serial: bool) -> Result<(), String> {
             .map_err(|error| format!("reading a USB device descriptor: {error}"))?;
         if descriptor.vendor_id() == ELGATO_VENDOR_ID && descriptor.product_id() == HD60S_PRODUCT_ID
         {
+            match operation {
+                Operation::ObserveInterrupt(seconds) => {
+                    return observe_interrupt(device, seconds)
+                        .map_err(|error| format!("observing HD60 S interrupt endpoint: {error}"));
+                }
+                Operation::ObserveStream(seconds) => return observe_stream(device, seconds),
+                Operation::Inspect => {}
+            }
             return inspect_device(device, descriptor, show_serial)
                 .map_err(|error| format!("inspecting HD60 S: {error}"));
         }
@@ -118,10 +216,28 @@ fn run(show_serial: bool) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let show_serial = std::env::args()
-        .skip(1)
-        .any(|argument| argument == "--show-serial");
-    match run(show_serial) {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let show_serial = arguments.iter().any(|argument| argument == "--show-serial");
+    let seconds = || {
+        arguments
+            .get(1)
+            .map(String::as_str)
+            .unwrap_or("10")
+            .parse::<u64>()
+    };
+    let operation = match arguments.first().map(String::as_str) {
+        Some("observe") => seconds().map(Operation::ObserveInterrupt),
+        Some("observe-stream") => seconds().map(Operation::ObserveStream),
+        _ => Ok(Operation::Inspect),
+    };
+    let operation = match operation {
+        Ok(operation) => operation,
+        Err(_) => {
+            eprintln!("error: usage: hd60s-linux [observe|observe-stream] [SECONDS]");
+            return ExitCode::FAILURE;
+        }
+    };
+    match run(show_serial, operation) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");

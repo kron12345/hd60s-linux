@@ -17,6 +17,18 @@ interfaces, alternate settings, and endpoints:
 cargo run
 ```
 
+Observe the device's interrupt endpoint without sending vendor commands:
+
+```bash
+cargo run -- observe 10
+```
+
+Perform a bounded read of the advertised bulk stream alternate setting:
+
+```bash
+cargo run -- observe-stream 10
+```
+
 Run tests with:
 
 ```bash

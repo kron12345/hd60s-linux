@@ -27,6 +27,20 @@ only when a trace or repeatable experiment supports them.
 - Signal detection and resolution negotiation messages.
 - Start, stop, reset, and error-recovery sequences.
 
+## Experiment log
+
+- A read-only attempt to open the device and claim interface 1 appeared to block
+  for more than 30 seconds and was terminated before stage logging was added.
+  The device enumerated normally afterward.
+- A subsequent instrumented run confirmed no kernel driver was bound, claimed
+  interface 1 successfully, and received zero unsolicited packets from interrupt
+  endpoint `0x81` over three seconds.
+- A bounded read claimed interface 0, selected advertised bulk alternate setting
+  4, and received zero transfers from endpoint `0x83` over three seconds. The
+  alternate setting change completed normally and the local capture was empty.
+- Together, the endpoint observations indicate that a host control sequence must
+  arm notifications and streaming before either endpoint becomes active.
+
 ## Trace experiment matrix
 
 Record each experiment from USB connection through clean capture shutdown:
