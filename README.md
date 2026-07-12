@@ -72,6 +72,8 @@ The provisional OBS transport and test procedure are in
 [docs/obs.md](docs/obs.md).
 Reproducible facts from the official Windows driver are recorded in
 [docs/vendor-driver-analysis.md](docs/vendor-driver-analysis.md).
+The exact continuation state and next-session checklist are in
+[docs/next-session.md](docs/next-session.md).
 
 ## Legal and safety boundaries
 
