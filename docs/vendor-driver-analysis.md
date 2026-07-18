@@ -46,12 +46,13 @@ Addresses below are virtual addresses for the exact driver hash above and are
 not protocol constants:
 
 - bulk/isochronous mode-selection function: `0x140228108`;
+- PnP initialization function: `0x140228a08`;
 - MCU LDROM idle check: `0x140247ca4`;
 - preview-video-resolution property path near `0x140242943`.
 
-The next static-analysis task is to identify the lower-level USB request helper
-called from the device initialization path, then express observed requests as a
-new protocol description rather than copying driver code.
+The lower-level USB request helper and both register-transport branches are now
+identified below. Runtime tracing remains necessary to confirm which branches
+and responses occur on the development device.
 
 ## Class-interface transfer layout
 
@@ -86,10 +87,13 @@ initialization subset.
 
 ## Normal Rev. 2 startup register sequence
 
-The recognized Elgato device branch in `0x14022b7c0` skips the MCU-maintenance
-block and begins ordinary volatile register access. Its generic register helper
-uses class-interface request `0xc0`, `wValue` as the register bank/device, and
-`wIndex` as the register address.
+The recognized Elgato device branch in `0x14022b7c0` skips the local
+MCU-maintenance block and begins ordinary volatile register access. Normal
+register access has two statically selected forms behind generic helpers at
+`0x14022e590` (write) and `0x140228038` (read).
+
+The direct form uses class-interface request `0xc0`, `wValue` as the register
+bank/device, and `wIndex` as the register address.
 
 For product `005e`, the observed static sequence begins:
 
@@ -103,17 +107,16 @@ Only step 1 is implemented for live validation. The writes remain disabled until
 an official-driver trace confirms ordering, timing, and the mode-dependent value
 for register `0x003b`.
 
-Live validation of step 1 against a power-on Rev. 2 device returned a USB I/O
-error. The device remained healthy and enumerated normally. Static call context
-therefore does not yet include an earlier prerequisite that enables this register
-transport; no startup write has been attempted.
+Live validation of the direct form in step 1 against a power-on Rev. 2 device
+returned a USB I/O error. The device remained healthy and enumerated normally.
+No startup write has been attempted.
 
 Further caller analysis established that object field `0x69c0` represents the
 selected input mode rather than hardware revision. Input mode 4 selects the
 compact HDMI initializer containing the `0x98` sequence. Other modes enter a
 larger MST3367 tuning path.
 
-The same generic register transport services bank `0x9c` and others. Its normal
+The same generic register helpers service bank `0x9c` and others. Direct
 one-byte write framing is:
 
 - class-interface OUT;
@@ -122,5 +125,31 @@ one-byte write framing is:
 - `wIndex = register address`;
 - one-byte transfer payload.
 
-The matching read uses class-interface IN with the same request/value/index
-layout. The PnP-time operation that enables this transport remains unidentified.
+The matching direct read uses class-interface IN with the same
+request/value/index layout.
+
+## MCU-proxied register transport
+
+When object field `0x63f0` records that an MCU proxy is present and device field
+`0x1fc4` does not force direct access, both generic helpers route through the
+builder at `0x14025a294`. The resulting class-interface transactions are:
+
+- write bank `0x98`: request `0xc0`, `wValue = 0x5098`, `wIndex = 0`, payload
+  starts with register then data;
+- write bank `0x9c`: the same form with `wValue = 0x509c`;
+- read command: request `0xc0` OUT, `wValue = 0x5066`, `wIndex = 0`, payload
+  starts with `bank | 1`, read length, then register bytes;
+- read response: request `0xc0` IN, `wValue = 0x5066`, `wIndex = 0`.
+
+For example, the first one-byte bank `0x98`, register `0x3b` read becomes an OUT
+payload `99 01 3b`, followed by a one-byte IN response. This is a static
+reconstruction, not yet a captured runtime transaction.
+
+The product `005e` path through PnP initializer `0x140228a08` statically reaches
+requests `0xec`, `0xc2`, and `0xc7`, then calls the sensitive MCU-presence path
+at `0x140247a04`, and later issues request `0xc6` before normal capture
+initialization. The MCU path includes `c1/0039` internal-register operations and
+request-`0xaa` proxy traffic. These calls explain how field `0x63f0` can become
+set and why the direct live probe can fail, but their side effects and runtime
+responses are not established. None may be replayed until an official-driver
+trace confirms the exact sequence.

@@ -2,10 +2,10 @@
 name = "hd60s-linux"
 version = "0.1.0"
 edition = "2024"
+default-run = "hd60s-linux"
 description = "Experimental userspace Linux driver for the original Elgato HD60 S"
 license = "MIT"
 repository = "https://github.com/Hydrogen2K/hd60s-linux"
 
 [dependencies]
 rusb = "0.9.4"
-

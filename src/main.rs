@@ -183,7 +183,7 @@ fn observe_stream<T: UsbContext>(device: Device<T>, seconds: u64) -> Result<(), 
     Ok(())
 }
 
-fn read_startup_status<T: UsbContext>(device: Device<T>) -> Result<(), String> {
+fn read_direct_startup_status<T: UsbContext>(device: Device<T>) -> Result<(), String> {
     let handle = device
         .open()
         .map_err(|error| format!("opening device: {error}"))?;
@@ -202,7 +202,7 @@ fn read_startup_status<T: UsbContext>(device: Device<T>) -> Result<(), String> {
             &mut response,
             Duration::from_secs(1),
         )
-        .map_err(|error| format!("reading startup status register: {error}"))?;
+        .map_err(|error| format!("reading direct-form startup status register: {error}"))?;
     if length != response.len() {
         return Err(format!(
             "startup status returned {length} byte(s), expected 1"
@@ -210,7 +210,7 @@ fn read_startup_status<T: UsbContext>(device: Device<T>) -> Result<(), String> {
     }
 
     println!(
-        "class-interface IN request=0x{REGISTER_REQUEST:02x} value=0x{HDMI_REGISTER_BANK:04x} index=0x{STARTUP_STATUS_REGISTER:04x}: 0x{:02x}",
+        "direct class-interface IN request=0x{REGISTER_REQUEST:02x} value=0x{HDMI_REGISTER_BANK:04x} index=0x{STARTUP_STATUS_REGISTER:04x}: 0x{:02x}",
         response[0]
     );
     Ok(())
@@ -241,7 +241,7 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
                         .map_err(|error| format!("observing HD60 S interrupt endpoint: {error}"));
                 }
                 Operation::ObserveStream(seconds) => return observe_stream(device, seconds),
-                Operation::Status => return read_startup_status(device),
+                Operation::Status => return read_direct_startup_status(device),
                 Operation::Inspect => {}
             }
             return inspect_device(device, descriptor, show_serial)
@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_status_is_a_class_interface_read() {
+    fn direct_startup_status_is_a_class_interface_read() {
         assert_eq!(
             rusb::request_type(Direction::In, RequestType::Class, Recipient::Interface),
             0xa1

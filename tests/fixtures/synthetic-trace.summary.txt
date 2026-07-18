@@ -1,0 +1,15 @@
+trace rows: 10
+class-interface records: 8
+classifications:
+  endpoint-interrupt-0x81: 1
+  endpoint-stream-0x83: 1
+  sensitive-board-memory: 1
+  sensitive-eeprom: 1
+  sensitive-internal-register: 1
+  unknown-class-request: 2
+  volatile-register-direct-bank-0x0098: 1
+  volatile-register-proxy-read-bank-0x0098: 1
+  volatile-register-proxy-write-bank-0x009c: 1
+endpoints:
+  0x81 interrupt: records=1 payload_records=1 bytes=4
+  0x83 stream: records=1 payload_records=1 bytes=188

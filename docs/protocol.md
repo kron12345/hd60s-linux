@@ -20,7 +20,7 @@ only when a trace or repeatable experiment supports them.
 
 ## Unknown
 
-- Meaning and ordering of vendor control requests.
+- Runtime meaning and ordering of the PnP-time class control requests.
 - Whether runtime firmware is uploaded by the host.
 - Video transport: encoded, raw, or proprietary framing.
 - Audio transport and clock source.
@@ -40,11 +40,33 @@ only when a trace or repeatable experiment supports them.
   alternate setting change completed normally and the local capture was empty.
 - Together, the endpoint observations indicate that a host control sequence must
   arm notifications and streaming before either endpoint becomes active.
-- A reconstructed read-only class-interface request for bank `0x0098`, register
+- A reconstructed direct-form class-interface read for bank `0x0098`, register
   `0x003b` was attempted with a one-second libusb timeout. The power-on device
   rejected it with an I/O error and continued to enumerate normally afterward.
-  This indicates that an earlier volatile enable sequence is required before the
-  normal startup register sequence documented by the Windows driver can run.
+  Later static analysis showed that the official Rev. 2 PnP path can select an
+  MCU-proxied register transport instead. The failure therefore rejects the
+  direct framing in this state; it does not by itself prove that a simple enable
+  write is missing.
+
+## Statically recovered register transport variants
+
+The Windows driver has direct and MCU-proxied variants behind the same generic
+register helpers. These are static facts awaiting runtime trace confirmation on
+the development device.
+
+- Direct access uses request `0xc0`, `wValue` as bank, `wIndex` as register, and
+  the register payload directly.
+- A proxied write to bank `0x98` or `0x9c` uses class-interface OUT request
+  `0xc0`, `wValue` `0x5098` or `0x509c`, `wIndex` zero, and a payload beginning
+  with the register followed by its data.
+- A proxied read first uses class-interface OUT request `0xc0`, `wValue`
+  `0x5066`, `wIndex` zero. A one-byte bank `0x98`, register `0x3b` read is encoded
+  as payload `99 01 3b`. A class-interface IN request with value `0x5066` then
+  obtains the response.
+
+The official Rev. 2 PnP branch reaches MCU-presence and internal-register logic
+before normal HDMI register access. That surrounding sequence remains
+prohibited from live replay until it appears in a normal official-driver trace.
 
 ## Trace experiment matrix
 

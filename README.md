@@ -35,15 +35,32 @@ Read the first confirmed volatile startup status register without writing:
 cargo run -- status
 ```
 
-On a power-on Rev. 2 device this currently returns a USB I/O error, confirming
-that an earlier volatile enable sequence is required. The command remains a
-bounded protocol diagnostic, not a working signal-status query.
+On a power-on Rev. 2 device this currently returns a USB I/O error. Static
+analysis now shows that this is only the direct fallback form of register
+access. The official driver first performs a sensitive MCU-presence handshake
+and can then use a tunneled register form. The command remains a bounded direct-
+transport diagnostic, not a working signal-status query; the handshake and
+proxy sequence are intentionally not implemented without a trace.
 
 Run tests with:
 
 ```bash
 cargo test
 ```
+
+Analyze a decoded USB trace and write a conservatively redacted TSV with
+protocol classifications:
+
+```bash
+cargo run --locked --bin analyze-usb-trace -- \
+  research/traces/T01-1080p60-start-stop.tsv \
+  research/traces/T01-1080p60-start-stop.sanitized.tsv
+```
+
+Only confirmed volatile register traffic retains payloads. Sensitive and
+unknown control requests, interrupt payloads, and captured media are redacted.
+The analyzer also prints request classifications and endpoint activity totals.
+Its synthetic golden tests do not require Wireshark.
 
 Access may require a udev rule. During development, grant only the device's
 interactive desktop user access rather than making it world writable:

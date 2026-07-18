@@ -41,12 +41,46 @@ HDMI content, and vendor firmware traffic.
 ./tools/decode-usb-trace \
   research/traces/T01-1080p60-start-stop.pcapng \
   research/traces/T01-1080p60-start-stop.tsv
+
+cargo run --locked --bin analyze-usb-trace -- \
+  research/traces/T01-1080p60-start-stop.tsv \
+  research/traces/T01-1080p60-start-stop.sanitized.tsv
 ```
 
 The decoder exports class-interface transfers and endpoints `0x81`/`0x83`.
 Standard descriptor requests are excluded so serial descriptors do not enter
-derived fixtures. Inspect decoded payloads before publishing them; class traffic
-can still contain sensitive maintenance data if a firmware utility was opened.
+derived fixtures. Its output remains private and unsanitized.
+
+The Rust analyzer adds a classification column and retains payload bytes only
+for recognized volatile bank `0x98`/`0x9c` traffic. It recognizes both direct
+request values and the statically recovered `0x5098`/`0x509c` proxy writes and
+`0x5066` read commands. It redacts known EEPROM, board-memory, and internal-
+register requests; all unknown class-request payloads; and endpoint
+`0x81`/`0x83` payloads. This conservative unknown-request rule also protects MCU
+traffic whose framing has not been classified. Endpoint record and byte totals
+remain in the summary.
+
+Automatic redaction is a safety baseline, not proof that a trace is publishable.
+Inspect the sanitized TSV and its classifications before committing it. Keep the
+raw capture and first decoded TSV under the ignored `research/traces/` directory.
 
 Never update firmware or open maintenance/debug property pages while tracing.
 
+## If a local Windows VM is unavailable
+
+The best substitute is a separate or dual-boot Windows installation connected
+to the physical HD60 S. Capture the official driver's USB traffic with
+[USBPcap](https://github.com/desowin/usbpcap), then copy the PCAPNG file back to
+this repository for offline decoding. Do not use a Windows installation booted
+from USB storage for this method: USBPcap is a USB filter driver and its project
+[warns against Windows To Go installations](https://github.com/desowin/usbpcap/issues/61).
+
+Wine cannot load the Elgato AVStream kernel minidriver. GitHub-hosted Windows
+runners and ordinary cloud VMs also cannot access this workstation's physical
+USB device. Static analysis can narrow hypotheses but cannot establish safe
+runtime ordering, timing, or device responses.
+
+QEMU remains the preferred local route because Linux `usbmon` records the host
+side while the unmodified official driver controls the passed-through device.
+[QEMU supports matching a host USB device by vendor and product ID](https://www.qemu.org/docs/master/system/devices/usb.html),
+which the existing `hd60s-vm` launcher uses for `0fd9:005e`.

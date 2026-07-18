@@ -28,10 +28,14 @@ endpoint `0x83`, and feed the existing localhost MPEG-TS transport into OBS.
   prerequisite audit.
 - Host usbmon capture and sanitized TSV decoding scripts now exist as
   `tools/capture-usbmon` and `tools/decode-usb-trace`.
-- The installed `status` command reconstructs the first normal HDMI register
-  read, but the power-on device rejects it with an I/O error. The card continues
-  to enumerate normally. This proves an earlier PnP-time volatile enable remains
-  missing; do not add writes to work around the stall.
+- The `analyze-usb-trace` Rust binary classifies decoded TSV records, redacts
+  sensitive and unknown payloads by default, summarizes endpoint `0x81`/`0x83`
+  activity, and has a synthetic golden test independent of `tshark`.
+- The installed `status` command reconstructs the direct fallback form of the
+  first HDMI register read. The power-on device rejects it with an I/O error and
+  continues to enumerate normally. Static analysis later recovered the distinct
+  MCU-proxied form used when the PnP presence check succeeds. Do not implement
+  the sensitive presence handshake or add writes without a trace.
 
 ## Verified protocol facts
 
@@ -44,8 +48,12 @@ endpoint `0x83`, and feed the existing localhost MPEG-TS transport into OBS.
 - The driver supports product IDs `004f`, `005e`, `0074`, and `0076`.
 - Driver and installer hashes and static-analysis anchors are recorded in
   `docs/vendor-driver-analysis.md`.
-- Normal register access uses class-interface request `0xc0`, with `wValue` as
-  the bank/device, `wIndex` as the register, and a one-byte payload.
+- Direct register access uses class-interface request `0xc0`, with `wValue` as
+  bank/device and `wIndex` as register. The MCU-proxied form uses values
+  `0x5098`/`0x509c` for writes and a `0x5066` command/response pair for reads.
+- The product `005e` PnP path statically reaches requests `0xec`, `0xc2`, and
+  `0xc7`, a sensitive MCU-presence check, and request `0xc6` before capture
+  initialization. Runtime payloads and responses remain unverified.
 - Input mode 4 selects the compact HDMI initializer. Its statically recovered
   bank `0x98` sequence begins with register `0x3b`, followed by writes to `0x20`,
   `0x00`, and `0x10`; those writes remain intentionally disabled pending a trace.
@@ -74,16 +82,15 @@ The user must run:
 sudo pacman -S --needed qemu-desktop edk2-ovmf swtpm wireshark-cli
 ```
 
-Obtain an official Windows 10 or 11 ISO and record its absolute path. QEMU and a
-Windows ISO were not present at the end of this session.
+Obtain an official Windows 10 or 11 ISO and record its absolute path. The latest
+audit found 363 GiB free, CPU virtualization flags present, no `/dev/kvm`, and
+the HD60 S connected. QEMU, OVMF, `tshark`, `dumpcap`, and a Windows ISO were
+absent. VirtualBox 7.2.12 was installed but unusable because its device node and
+USB extension pack were absent.
 
 ## Next steps
 
-1. Implement a Rust analyzer for the sanitized TSV trace format. It must classify
-   known volatile bank `0x98`/`0x9c` register traffic, automatically redact
-   EEPROM/board-memory/MCU payloads, label unknown requests, summarize endpoint
-   `0x81`/`0x83` activity, and include synthetic golden tests that do not require
-   `tshark`.
+1. **Completed:** implement and test the conservative Rust TSV analyzer.
 2. Verify QEMU, OVMF, KVM access, `tshark`, the ISO path, free disk space, and
    USB access.
 3. Update `/home/hayden/hd60s-linux-bridge/hd60s-vm` if necessary and create a
