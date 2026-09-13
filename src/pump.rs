@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::time::{Duration, Instant};
 
+use std::sync::mpsc::{SyncSender, TrySendError};
+
 use rusb::{DeviceHandle, UsbContext};
 
 use crate::frame::{Assembler, Event, Frame, Stats};
@@ -66,21 +68,7 @@ pub fn run_with_stats<T: UsbContext + 'static>(
                 .map_err(|error| format!("selecting interface 0 alternate setting 4: {error}"))?;
             let reader_handle = handle.clone();
             let reader = std::thread::spawn(move || -> Result<(), String> {
-                let handle = reader_handle;
-                let timeout = Duration::from_millis(200);
-                let mut buffer = vec![0_u8; 1024 * 1024];
-                while !reader_stop.load(Ordering::Relaxed) {
-                    match handle.read_bulk(0x83, &mut buffer, timeout) {
-                        Ok(length) => {
-                            if sender.send(buffer[..length].to_vec()).is_err() {
-                                break;
-                            }
-                        }
-                        Err(rusb::Error::Timeout) => {}
-                        Err(error) => return Err(format!("reading bulk endpoint 0x83: {error}")),
-                    }
-                }
-                Ok(())
+                bulk_reader(&reader_handle, sender, reader_stop)
             });
             (reader, Some(handle))
         }
@@ -153,4 +141,148 @@ pub fn run_with_stats<T: UsbContext + 'static>(
         return Err(error);
     }
     Ok(assembler.stats)
+}
+
+/// Transfers kept in flight on the bulk endpoint. The device drops data
+/// during any gap between transfers, so several are always queued and each
+/// is resubmitted from its completion callback; nothing that happens on
+/// other threads (register reads, a slow consumer) can then open a gap.
+const BULK_TRANSFERS: usize = 8;
+const BULK_TRANSFER_BYTES: usize = 1 << 20;
+
+struct BulkState {
+    sender: SyncSender<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+    error: Option<String>,
+    in_flight: usize,
+    dropped: u64,
+}
+
+extern "system" fn bulk_callback(transfer: *mut libusb1_sys::libusb_transfer) {
+    // SAFETY: the transfer and its user data were created in `bulk_reader`
+    // and stay alive until every transfer has been freed there.
+    unsafe {
+        let state = &mut *((*transfer).user_data as *mut BulkState);
+        state.in_flight -= 1;
+        use libusb1_sys::constants::*;
+        match (*transfer).status {
+            LIBUSB_TRANSFER_COMPLETED | LIBUSB_TRANSFER_TIMED_OUT => {
+                let got = (*transfer).actual_length as usize;
+                if got > 0 {
+                    let chunk = std::slice::from_raw_parts((*transfer).buffer, got).to_vec();
+                    match state.sender.try_send(chunk) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => state.dropped += 1,
+                        Err(TrySendError::Disconnected(_)) => {
+                            state.stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            LIBUSB_TRANSFER_CANCELLED => return,
+            LIBUSB_TRANSFER_NO_DEVICE => {
+                state.error = Some(
+                    "reading bulk endpoint 0x83: No such device (it may have been disconnected)"
+                        .into(),
+                );
+                return;
+            }
+            other => {
+                state.error = Some(format!(
+                    "reading bulk endpoint 0x83: transfer status {other}"
+                ));
+                return;
+            }
+        }
+        if state.stop.load(Ordering::Relaxed) || state.error.is_some() {
+            return;
+        }
+        if libusb1_sys::libusb_submit_transfer(transfer) == 0 {
+            state.in_flight += 1;
+        } else {
+            state.error = Some("resubmitting a bulk transfer failed".into());
+        }
+    }
+}
+
+fn bulk_reader<T: UsbContext>(
+    handle: &DeviceHandle<T>,
+    sender: SyncSender<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let mut state = Box::new(BulkState {
+        sender,
+        stop: stop.clone(),
+        error: None,
+        in_flight: 0,
+        dropped: 0,
+    });
+    let mut buffers: Vec<Vec<u8>> = (0..BULK_TRANSFERS)
+        .map(|_| vec![0_u8; BULK_TRANSFER_BYTES])
+        .collect();
+    let mut transfers = Vec::with_capacity(BULK_TRANSFERS);
+    let context = handle.context().as_raw();
+    let wait = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 100_000,
+    };
+    // SAFETY: plain libusb asynchronous API; every pointer handed to libusb
+    // outlives the transfers, which are cancelled and freed below.
+    unsafe {
+        for buffer in buffers.iter_mut() {
+            let transfer = libusb1_sys::libusb_alloc_transfer(0);
+            if transfer.is_null() {
+                state.error = Some("allocating a bulk transfer".into());
+                break;
+            }
+            (*transfer).dev_handle = handle.as_raw();
+            (*transfer).endpoint = 0x83;
+            (*transfer).transfer_type = libusb1_sys::constants::LIBUSB_TRANSFER_TYPE_BULK;
+            (*transfer).timeout = 1000;
+            (*transfer).buffer = buffer.as_mut_ptr();
+            (*transfer).length = buffer.len() as i32;
+            (*transfer).num_iso_packets = 0;
+            (*transfer).callback = bulk_callback;
+            (*transfer).user_data = &mut *state as *mut BulkState as *mut std::ffi::c_void;
+            transfers.push(transfer);
+            let rc = libusb1_sys::libusb_submit_transfer(transfer);
+            if rc != 0 {
+                state.error = Some(format!("submitting a bulk transfer: libusb error {rc}"));
+                break;
+            }
+            state.in_flight += 1;
+        }
+        while !stop.load(Ordering::Relaxed) && state.error.is_none() {
+            libusb1_sys::libusb_handle_events_timeout_completed(
+                context,
+                &wait,
+                std::ptr::null_mut(),
+            );
+        }
+        for transfer in &transfers {
+            libusb1_sys::libusb_cancel_transfer(*transfer);
+        }
+        let mut rounds = 0;
+        while state.in_flight > 0 && rounds < 30 {
+            libusb1_sys::libusb_handle_events_timeout_completed(
+                context,
+                &wait,
+                std::ptr::null_mut(),
+            );
+            rounds += 1;
+        }
+        for transfer in transfers {
+            libusb1_sys::libusb_free_transfer(transfer);
+        }
+    }
+    if state.dropped > 0 {
+        eprintln!(
+            "USB reader: {} chunk(s) dropped because the consumer fell behind",
+            state.dropped
+        );
+    }
+    match state.error.take() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }

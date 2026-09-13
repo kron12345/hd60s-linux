@@ -52,6 +52,13 @@ kernel driver bound to the device is detached automatically. Frames are
 always 1920x1080 YUYV (smaller sources are centred on a black canvas), audio
 is 48 kHz stereo.
 
+The USB read keeps eight 1 MB bulk transfers queued in the kernel at all
+times (libusb's asynchronous API), because the device drops data during
+any gap between transfers: measured over 60 s with the panel polling the
+preview and the tray refreshing, this delivers 59.96 fps with no damaged
+frames, where one synchronous read at a time lost about 4 frames a second
+to the gaps that register reads from other threads opened.
+
 The service waits for a card if none is present and picks it up again after
 an unplug or reset; the camera and microphone nodes stay in place meanwhile
 (viewers see black and silence), so OBS keeps its sources. Run only one
