@@ -18,7 +18,9 @@ command -v tshark >/dev/null || {
 
 # Export class-interface setup packets and endpoint 0x81/0x83 traffic only.
 # Standard descriptor requests are deliberately excluded to avoid serial strings.
-readonly filter='(usb.bmRequestType.type == 1 && usb.bmRequestType.recipient == 1) || usb.endpoint_address == 0x81 || usb.endpoint_address == 0x83'
+# The driver's register traffic appears on the wire as vendor/device requests
+# (bmRequestType 0x40/0xc0), not as class/interface requests; keep both forms.
+readonly filter='(usb.bmRequestType.type == 1 && usb.bmRequestType.recipient == 1) || (usb.bmRequestType.type == 2 && usb.bmRequestType.recipient == 0) || usb.endpoint_address == 0x81 || usb.endpoint_address == 0x83'
 
 {
   printf 'frame\ttime\turb_type\ttransfer_type\tbus\taddress\tendpoint\tbmRequestType\tbRequest\twValue\twIndex\twLength\tdata_length\trequest_data\tresponse_data\n'

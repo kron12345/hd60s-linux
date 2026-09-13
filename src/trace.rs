@@ -139,8 +139,10 @@ pub fn analyze_tsv(input: &str) -> Result<TraceAnalysis, String> {
             .entry(classification.to_owned())
             .or_default() += 1;
 
+        // The driver's register transport shows up on the wire as vendor/device
+        // (0x40/0xc0) rather than class/interface (0x21/0xa1); count both.
         if bm_request_type
-            .map(|request_type| request_type & 0x7f == 0x21)
+            .map(|request_type| matches!(request_type & 0x7f, 0x21 | 0x40))
             .unwrap_or(false)
         {
             summary.class_interface_records += 1;
@@ -219,6 +221,13 @@ fn classify(
     match (request, value, direction_in) {
         (Some(0xc0), Some(0x0098), _) => "volatile-register-direct-bank-0x0098",
         (Some(0xc0), Some(0x009c), _) => "volatile-register-direct-bank-0x009c",
+        // Rev. 4 (0fd9:0076) uses bank 0x64 where Rev. 2 uses 0x98; seen live
+        // as vendor/device requests 0x40/0xc0 in a usbmon trace.
+        (Some(0xc0), Some(0x0064), _) => "volatile-register-direct-bank-0x0064",
+        (Some(0xc0), Some(0x5064), false) => "volatile-register-proxy-write-bank-0x0064",
+        (Some(0xc0), Some(0x5066), false) if first_payload_byte(request_data) == Some(0x65) => {
+            "volatile-register-proxy-read-bank-0x0064"
+        }
         (Some(0xc0), Some(0x5098), false) => "volatile-register-proxy-write-bank-0x0098",
         (Some(0xc0), Some(0x509c), false) => "volatile-register-proxy-write-bank-0x009c",
         (Some(0xc0), Some(0x5066), false) if first_payload_byte(request_data) == Some(0x99) => {

@@ -183,13 +183,52 @@ complete fps arrived, with 308 incomplete frames in 10 seconds. With a
 decoupled reader thread and 1 MB buffers it is 57.8 to 59.6 fps with 0 to 19
 incomplete frames.
 
+### What the official driver does (usbmon trace of a Windows VM, Rev. 4)
+
+Recorded on 2026-09-13 with the Elgato driver `CY3014.X64.SYS` and the Game
+Capture HD application in a QEMU guest, `usbmon` on the host. Raw traces stay
+private (they contain the serial and captured video).
+
+- **All register traffic is vendor/device** (`bmRequestType 0x40` OUT, `0xc0`
+  IN), not class/interface as the static analysis assumed. The direct form is
+  `bRequest 0xc0`, `wValue` = bank, `wIndex` = register. The decoder and the
+  analyzer now accept that form; the earlier live probe used class/interface,
+  which is a plausible reason for its I/O error.
+- **Rev. 4 works on bank `0x64`** where the Rev. 2 analysis found `0x98`.
+- **PnP sequence** 2.3 s after enumeration, in this order: `0xec` OUT (10 B),
+  `0xc1` OUT `wValue 0xc039` and `0x4134`, `0xc1` IN `0x0039` (1 B → `01`),
+  proxied read `0xc0 OUT wValue 0x5066` with payload `ab 03 12 34 57` followed
+  by ten 3-byte `0x5066` IN reads, the same with `... 34 58`, then `0xc2`,
+  `0xc7 wValue 0x64`, `0xc6 wIndex 0x100`, and bank `0x64` writes: register
+  `0x13` := `80 80 80 80`, `0x3a` := `00`, `0x3b` := `80`. Afterwards the
+  driver reads bank `0x64` register `0` (32 bytes) every 105 ms for as long as
+  it is loaded; the value never changed with a stable 1080p60 input.
+- **Stream start** by the application: bank `0x64` register `0x3b` := `80`,
+  register **`0x10` := `01`**, then `SET_INTERFACE` alternate setting **2**
+  (isochronous). Video follows 38 ms later at about 250 URBs/s. **Stream stop**
+  is the mirror image: alternate setting 0, then register `0x10` := `00`. The
+  official path is therefore isochronous; the bulk path (alternate setting 4)
+  used by `capture` needs none of this and keeps working.
+- 1.5 s after the stream starts the application writes register `0x13` :=
+  `80 81 80 80` and 3 s later `80 80 80 80` again. Purpose unknown.
+- Before starting, the application reads the **EDID from bank `0xa0`**
+  (256 bytes as 16 reads of 16 bytes at `wIndex` 0, 16, … 240), writes it
+  back, then writes a version with the monitor name changed from "Elgato" to
+  "HD60 S". The EDID the box presents to the HDMI source is therefore writable.
+- **Interrupt endpoint `0x81` carried no data at any point**, not even with the
+  official application streaming.
+- **The light strip stayed off throughout** — after PnP, while streaming, and
+  during the `0x13` pulse. Either none of this drives it or the strip on this
+  unit is dead.
+
 ### Still open
 
 - Behaviour with other input resolutions and frame rates, including interlaced
   sources (the F bit is parsed but not yet used).
 - Behaviour on signal loss, with an HDCP-protected source, and on a resolution
   change while streaming.
-- Purpose of the isochronous alternate settings 1 to 3.
-- Meaning of interrupt endpoint `0x81`, which stays silent without a control
-  sequence.
+- Purpose of the isochronous alternate settings 1 and 3 (the official
+  application uses 2).
+- Meaning of interrupt endpoint `0x81`, which stayed silent even under the
+  official driver and application.
 - Whether Rev. 1 to 3 stream without initialization as well.
