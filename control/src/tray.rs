@@ -8,12 +8,10 @@ use ksni::blocking::TrayMethods;
 use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Icon, ToolTip};
 use serde_json::Value;
-use slint::ComponentHandle;
 
-use crate::{MainWindow, Runtime};
+use crate::Runtime;
 
 pub struct Tray {
-    window: slint::Weak<MainWindow>,
     runtime: Arc<Runtime>,
     state: u8, // 0 no service/card, 1 no signal, 2 streaming
     description: String,
@@ -80,10 +78,8 @@ impl Tray {
     }
 
     fn show_window(&self) {
-        let _ = self.window.upgrade_in_event_loop(|ui| {
-            let _ = ui.show();
-            ui.window().set_minimized(false);
-        });
+        let runtime = self.runtime.clone();
+        let _ = slint::invoke_from_event_loop(move || crate::show_window(&runtime));
     }
 }
 
@@ -176,12 +172,8 @@ impl ksni::Tray for Tray {
 
 /// Publishes the icon; returns the handle used to refresh it. `None` when
 /// there is no session bus or no tray host.
-pub fn start(
-    window: slint::Weak<MainWindow>,
-    runtime: Arc<Runtime>,
-) -> Option<ksni::blocking::Handle<Tray>> {
+pub fn start(runtime: Arc<Runtime>) -> Option<ksni::blocking::Handle<Tray>> {
     let tray = Tray {
-        window,
         runtime,
         state: 0,
         description: "starting".into(),

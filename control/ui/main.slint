@@ -58,6 +58,8 @@ export component MainWindow inherits Window {
     in-out property <int> autostart-index: 0;
     in-out property <string> autostart-hint: "";
     in-out property <bool> close-to-tray: true;
+    in-out property <string> access-text: "";
+    in-out property <bool> access-fixable: false;
     in-out property <bool> service-running: false;
 
     callback set-control(string, int);
@@ -70,6 +72,7 @@ export component MainWindow inherits Window {
     callback generate-report();
     callback set-autostart(int);
     callback set-close-to-tray(bool);
+    callback install-udev-rule();
     callback toggle-service();
 
     HorizontalBox {
@@ -151,6 +154,12 @@ export component MainWindow inherits Window {
                 VerticalBox {
                     padding: 0;
                     Text { text: root.service-text; wrap: word-wrap; }
+                    Text { text: root.access-text; color: #e0a640; wrap: word-wrap; visible: root.access-text != ""; }
+                    Button {
+                        text: "Install access rule (asks for the administrator password)";
+                        visible: root.access-fixable;
+                        clicked => { root.install-udev-rule(); }
+                    }
                     HorizontalBox {
                         padding: 0;
                         Text { text: "Autostart"; width: 90px; vertical-alignment: center; }

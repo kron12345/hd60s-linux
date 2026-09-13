@@ -1,16 +1,22 @@
 //! The control program for `hd60s-linux serve`: talks to the service over
 //! its Unix socket, shows the live picture and everything the card
-//! reports, and changes what can be changed. Nothing here touches USB.
+//! reports, and changes what can be changed. Nothing here touches USB
+//! directly, except for checking whether the user may.
+//!
+//! The window is created when it is shown and dropped when it is closed
+//! to the tray: a window that merely exists (even hidden) is listed by
+//! the desktop as a running application.
 
+use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use slint::{Image, Rgb8Pixel, SharedPixelBuffer};
+use slint::{ComponentHandle, Image, Rgb8Pixel, SharedPixelBuffer};
 
 slint::include_modules!();
 
@@ -18,24 +24,243 @@ mod tray;
 
 const WIDTH: usize = 1920;
 const HEIGHT: usize = 1080;
+const UDEV_RULE: &str = include_str!("../../packaging/70-hd60s-linux.rules");
+const UDEV_RULE_PATH: &str = "/etc/udev/rules.d/70-hd60s-linux.rules";
 
-/// What the tray and the window share.
+/// What the tray, the window and the threads share.
 pub struct Runtime {
     pub quitting: AtomicBool,
     pub close_to_tray: AtomicBool,
+    /// Preview downscaling factor, chosen from the widget's width.
+    pub factor: AtomicUsize,
+    /// Set while a converted frame waits for the UI thread.
+    pub busy: AtomicBool,
+    pub own: std::sync::Mutex<Option<OwnService>>,
+    /// The latest state, for a window created later.
+    pub last_state: std::sync::Mutex<Option<Value>>,
+    pub last_service: std::sync::Mutex<ServiceView>,
 }
 
-fn config_path() -> PathBuf {
+#[derive(Clone, Default)]
+pub struct ServiceView {
+    text: String,
+    autostart: usize,
+    running: bool,
+    access_text: String,
+    access_fixable: bool,
+}
+
+thread_local! {
+    /// The window, when it exists; only the UI thread touches it.
+    static WINDOW: RefCell<Option<MainWindow>> = const { RefCell::new(None) };
+}
+
+fn with_window(f: impl FnOnce(&MainWindow)) {
+    WINDOW.with(|w| {
+        if let Some(ui) = w.borrow().as_ref() {
+            f(ui);
+        }
+    });
+}
+
+// ---------------------------------------------------------------- service API
+
+fn socket_path() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("hd60s-linux/api.sock")
+}
+
+/// One HTTP request over the Unix socket; returns status and body.
+fn api(method: &str, path: &str) -> Result<(u16, Vec<u8>), String> {
+    let mut stream = UnixStream::connect(socket_path())
+        .map_err(|error| format!("service not running ({error})"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut data = Vec::new();
+    stream.read_to_end(&mut data).map_err(|e| e.to_string())?;
+    let split = data
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("malformed reply")?;
+    let head = String::from_utf8_lossy(&data[..split]);
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Ok((status, data[split + 4..].to_vec()))
+}
+
+fn state() -> Result<Value, String> {
+    let (_, body) = api("GET", "/api/state")?;
+    serde_json::from_slice(&body).map_err(|e| e.to_string())
+}
+
+pub fn post(path: &str) -> String {
+    match api("POST", path) {
+        Ok((_, body)) => {
+            let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            v["message"]
+                .as_str()
+                .or(v["changed"].as_str())
+                .or(v["error"].as_str())
+                .unwrap_or("")
+                .to_string()
+        }
+        Err(error) => error,
+    }
+}
+
+// ------------------------------------------------------------ device access
+
+/// Whether a card is on the bus and whether this user may open it.
+enum Access {
+    NoCard,
+    Ok,
+    Denied(String),
+}
+
+fn device_access() -> Access {
+    let Ok(entries) = std::fs::read_dir("/sys/bus/usb/devices") else {
+        return Access::NoCard;
+    };
+    let read = |p: PathBuf| {
+        std::fs::read_to_string(p)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if read(path.join("idVendor")) != "0fd9" {
+            continue;
+        }
+        if !["004f", "005e", "0074", "0076"].contains(&read(path.join("idProduct")).as_str()) {
+            continue;
+        }
+        let (bus, dev) = (read(path.join("busnum")), read(path.join("devnum")));
+        let (Ok(bus), Ok(dev)) = (bus.parse::<u32>(), dev.parse::<u32>()) else {
+            continue;
+        };
+        let node = format!("/dev/bus/usb/{bus:03}/{dev:03}");
+        let c = std::ffi::CString::new(node.clone()).unwrap();
+        // SAFETY: access() only inspects permissions of the given path.
+        let ok = unsafe { libc::access(c.as_ptr(), libc::R_OK | libc::W_OK) } == 0;
+        return if ok { Access::Ok } else { Access::Denied(node) };
+    }
+    Access::NoCard
+}
+
+fn udev_rule_installed() -> bool {
+    [
+        "/etc/udev/rules.d/70-hd60s-linux.rules",
+        "/usr/lib/udev/rules.d/70-hd60s-linux.rules",
+    ]
+    .iter()
+    .any(|p| std::path::Path::new(p).exists())
+}
+
+/// Writes the embedded rule through polkit (which asks for an
+/// administrator's password) and reloads udev. Without administrator
+/// rights the rule is saved in the user's config directory with the
+/// command an administrator needs.
+fn install_udev_rule() -> Result<String, String> {
+    let script = format!(
+        "printf '%s' \"$1\" > {UDEV_RULE_PATH} && udevadm control --reload-rules && udevadm trigger --subsystem-match=usb"
+    );
+    let status = std::process::Command::new("pkexec")
+        .args(["sh", "-c", &script, "sh", UDEV_RULE])
+        .status();
+    if matches!(&status, Ok(s) if s.success()) {
+        return Ok(format!(
+            "access rule installed at {UDEV_RULE_PATH}; unplug and plug the card once"
+        ));
+    }
+    let copy = config_dir().join("hd60s-linux/70-hd60s-linux.rules");
+    if let Some(dir) = copy.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&copy, UDEV_RULE);
+    Err(format!(
+        "not installed ({}). The rule is saved at {}; an administrator installs it with: sudo install -m644 {} {UDEV_RULE_PATH} && sudo udevadm control --reload-rules",
+        match status {
+            Ok(_) => "cancelled or no administrator rights".to_string(),
+            Err(e) => format!("pkexec: {e}"),
+        },
+        copy.display(),
+        copy.display()
+    ))
+}
+
+// ------------------------------------------------------------- service run
+
+/// `systemctl --user` for the service.
+fn systemctl(args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .arg("hd60s-serve.service")
+        .output()
+        .map_err(|e| format!("systemctl: {e}"))?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() || args[0].starts_with("is-") {
+        Ok(text)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// The service run by this program when systemd is not running it.
+pub struct OwnService(std::process::Child);
+
+impl Drop for OwnService {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn start_own_service() -> Result<OwnService, String> {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new("hd60s-linux");
+    command
+        .args(["serve", "--tray", "off"])
+        .stdin(std::process::Stdio::null());
+    // SAFETY: prctl only marks the child to receive SIGTERM when this
+    // process dies, however it dies — the service must never outlive the
+    // program that started it.
+    unsafe {
+        command.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    command
+        .spawn()
+        .map(OwnService)
+        .map_err(|e| format!("starting hd60s-linux serve: {e}"))
+}
+
+// --------------------------------------------------------------- settings
+
+fn config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("hd60s-linux/control.conf")
 }
 
 /// `key=value` lines; only `close_to_tray` so far.
 fn read_config() -> std::collections::HashMap<String, String> {
-    std::fs::read_to_string(config_path())
+    std::fs::read_to_string(config_dir().join("hd60s-linux/control.conf"))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| l.split_once('='))
@@ -46,7 +271,7 @@ fn read_config() -> std::collections::HashMap<String, String> {
 fn write_config(key: &str, value: &str) {
     let mut config = read_config();
     config.insert(key.to_string(), value.to_string());
-    let path = config_path();
+    let path = config_dir().join("hd60s-linux/control.conf");
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -58,11 +283,7 @@ fn write_config(key: &str, value: &str) {
 }
 
 fn autostart_file() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("autostart/hd60s-control.desktop")
+    config_dir().join("autostart/hd60s-control.desktop")
 }
 
 /// 0 none, 1 with the desktop (XDG autostart), 2 systemd user service.
@@ -105,61 +326,7 @@ fn set_autostart(mode: usize) -> Result<String, String> {
     }
 }
 
-fn socket_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("hd60s-linux/api.sock")
-}
-
-/// One HTTP request over the Unix socket; returns status and body.
-fn api(method: &str, path: &str) -> Result<(u16, Vec<u8>), String> {
-    let mut stream = UnixStream::connect(socket_path()).map_err(|error| {
-        format!("service not reachable ({error}); is `hd60s-serve.service` running?")
-    })?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|e| e.to_string())?;
-    stream
-        .write_all(
-            format!("{method} {path} HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
-    let mut data = Vec::new();
-    stream.read_to_end(&mut data).map_err(|e| e.to_string())?;
-    let split = data
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("malformed reply")?;
-    let head = String::from_utf8_lossy(&data[..split]);
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    Ok((status, data[split + 4..].to_vec()))
-}
-
-fn state() -> Result<Value, String> {
-    let (_, body) = api("GET", "/api/state")?;
-    serde_json::from_slice(&body).map_err(|e| e.to_string())
-}
-
-fn post(path: &str) -> String {
-    match api("POST", path) {
-        Ok((_, body)) => {
-            let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            v["message"]
-                .as_str()
-                .or(v["changed"].as_str())
-                .or(v["error"].as_str())
-                .unwrap_or("")
-                .to_string()
-        }
-        Err(error) => error,
-    }
-}
+// ------------------------------------------------------------------ frames
 
 /// BT.709 limited range, integer arithmetic; `factor` > 1 averages
 /// factor x factor source pixels (a box filter), which is what keeps the
@@ -194,52 +361,7 @@ fn yuyv_to_rgb(frame: &[u8], factor: usize) -> SharedPixelBuffer<Rgb8Pixel> {
     buffer
 }
 
-/// `systemctl --user` for the service.
-fn systemctl(args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .arg("hd60s-serve.service")
-        .output()
-        .map_err(|e| format!("systemctl: {e}"))?;
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if output.status.success() || args[0].starts_with("is-") {
-        Ok(text)
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
-}
-
-/// The service run by this program when systemd is not running it.
-struct OwnService(std::process::Child);
-
-impl Drop for OwnService {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn start_own_service() -> Result<OwnService, String> {
-    use std::os::unix::process::CommandExt;
-    let mut command = std::process::Command::new("hd60s-linux");
-    command
-        .args(["serve", "--tray", "off"])
-        .stdin(std::process::Stdio::null());
-    // SAFETY: prctl only marks the child to receive SIGTERM when this
-    // process dies, however it dies — the service must never outlive the
-    // program that started it.
-    unsafe {
-        command.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-            Ok(())
-        });
-    }
-    command
-        .spawn()
-        .map(OwnService)
-        .map_err(|e| format!("starting hd60s-linux serve: {e}"))
-}
+// -------------------------------------------------------------------- UI
 
 fn text(v: &Value, key: &str) -> String {
     v[key].as_str().unwrap_or("").to_string()
@@ -390,29 +512,41 @@ fn apply_state(ui: &MainWindow, s: &Value) {
     }
 }
 
-fn main() -> Result<(), slint::PlatformError> {
-    let start_in_tray = std::env::args().any(|a| a == "--tray");
-    // The Wayland app id (and X11 class) must match the desktop entry for
-    // the panel to show our icon and group the window.
-    slint::BackendSelector::new()
-        .with_winit_window_attributes_hook(|attributes| {
-            use slint::winit_030::winit::platform::wayland::WindowAttributesExtWayland as W;
-            use slint::winit_030::winit::platform::x11::WindowAttributesExtX11 as X;
-            let attributes = W::with_name(attributes, "hd60s-control", "hd60s-control");
-            X::with_name(attributes, "hd60s-control", "hd60s-control")
-        })
-        .select()?;
-    let ui = MainWindow::new()?;
-    let config = read_config();
-    let runtime = Arc::new(Runtime {
-        quitting: AtomicBool::new(false),
-        close_to_tray: AtomicBool::new(
-            config
-                .get("close_to_tray")
-                .map(|v| v != "false")
-                .unwrap_or(true),
-        ),
+fn apply_service(ui: &MainWindow, view: &ServiceView) {
+    ui.set_service_text(view.text.clone().into());
+    ui.set_autostart_index(view.autostart as i32);
+    ui.set_autostart_hint(
+        match view.autostart {
+            1 => "sway users: add `exec hd60s-control --tray` to the sway config instead.",
+            2 => "The unit keeps running when this program is closed.",
+            _ => "",
+        }
+        .into(),
+    );
+    ui.set_service_running(view.running);
+    ui.set_access_text(view.access_text.clone().into());
+    ui.set_access_fixable(view.access_fixable);
+}
+
+/// Runs a request off the UI thread, then refreshes.
+fn act(path: String) {
+    std::thread::spawn(move || {
+        let message = post(&path);
+        let refreshed = state().ok();
+        let _ = slint::invoke_from_event_loop(move || {
+            with_window(|ui| {
+                if let Some(s) = &refreshed {
+                    apply_state(ui, s);
+                }
+                ui.set_message(message.clone().into());
+            });
+        });
     });
+}
+
+/// Creates the window with all its callbacks; the caller shows it.
+fn build_window(runtime: &Arc<Runtime>) -> Result<MainWindow, slint::PlatformError> {
+    let ui = MainWindow::new()?;
     ui.set_close_to_tray(runtime.close_to_tray.load(Ordering::Relaxed));
     {
         let runtime = runtime.clone();
@@ -427,6 +561,15 @@ fn main() -> Result<(), slint::PlatformError> {
             if runtime.close_to_tray.load(Ordering::Relaxed)
                 && !runtime.quitting.load(Ordering::Relaxed)
             {
+                // Drop the window entirely (after this callback returns).
+                let _ = slint::invoke_from_event_loop(|| {
+                    WINDOW.with(|w| {
+                        if let Some(ui) = w.borrow_mut().take() {
+                            let _ = ui.hide();
+                        }
+                    });
+                    WINDOW_OPEN.store(false, Ordering::Relaxed);
+                });
                 slint::CloseRequestResponse::HideWindow
             } else {
                 let _ = slint::quit_event_loop();
@@ -434,38 +577,69 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         });
     }
-    let tray_handle = tray::start(ui.as_weak(), runtime.clone());
-    let busy = Arc::new(AtomicBool::new(false));
-    // Downscaling factor for the preview, chosen from the widget's width.
-    let factor = Arc::new(std::sync::atomic::AtomicUsize::new(2));
-    let own: Arc<std::sync::Mutex<Option<OwnService>>> = Arc::new(std::sync::Mutex::new(None));
-
-    // Service control: autostart mode, and the systemd unit or our own child.
+    ui.on_set_control(|key, value| act(format!("/api/set?{key}={value}")));
+    ui.on_set_range(|index| act(format!("/api/set?range={index}")));
+    ui.on_set_gain(|value| act(format!("/api/set?gain={value}")));
+    ui.on_reset_picture(|| act("/api/set?reset=1".into()));
     {
-        let own = own.clone();
         let weak = ui.as_weak();
+        ui.on_toggle_record(move || {
+            let ui = weak.unwrap();
+            act(if ui.get_recording() {
+                "/api/record?stop=1"
+            } else {
+                "/api/record?start=1"
+            }
+            .into());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_toggle_stream(move || {
+            let ui = weak.unwrap();
+            act(if ui.get_stream_on() {
+                "/api/stream?off=1"
+            } else {
+                "/api/stream?on=1"
+            }
+            .into());
+        });
+    }
+    ui.on_restore_edid(|| act("/api/edid?restore=1".into()));
+    ui.on_generate_report(|| {
+        std::thread::spawn(|| {
+            let report = match api("GET", "/api/report") {
+                Ok((_, body)) => String::from_utf8_lossy(&body).into_owned(),
+                Err(error) => error,
+            };
+            let _ = slint::invoke_from_event_loop(move || {
+                with_window(|ui| ui.set_report_text(report.clone().into()))
+            });
+        });
+    });
+    {
+        let runtime = runtime.clone();
         ui.on_set_autostart(move |index| {
-            let own = own.clone();
-            let weak = weak.clone();
+            let runtime = runtime.clone();
             std::thread::spawn(move || {
                 if index == 2 {
-                    own.lock().unwrap().take();
+                    runtime.own.lock().unwrap().take();
                 }
                 let message = set_autostart(index as usize).unwrap_or_else(|e| e);
-                let _ = weak.upgrade_in_event_loop(move |ui| ui.set_message(message.into()));
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_window(|ui| ui.set_message(message.clone().into()))
+                });
             });
         });
     }
     {
-        let own = own.clone();
-        let weak = ui.as_weak();
+        let runtime = runtime.clone();
         ui.on_toggle_service(move || {
-            let own = own.clone();
-            let weak = weak.clone();
+            let runtime = runtime.clone();
             std::thread::spawn(move || {
                 let running = state().is_ok();
                 let message = if running {
-                    if own.lock().unwrap().take().is_some() {
+                    if runtime.own.lock().unwrap().take().is_some() {
                         "service stopped".to_string()
                     } else {
                         systemctl(&["stop"])
@@ -479,96 +653,90 @@ fn main() -> Result<(), slint::PlatformError> {
                 } else {
                     match start_own_service() {
                         Ok(child) => {
-                            *own.lock().unwrap() = Some(child);
+                            *runtime.own.lock().unwrap() = Some(child);
                             "service started by this program".to_string()
                         }
                         Err(error) => error,
                     }
                 };
-                let _ = weak.upgrade_in_event_loop(move |ui| ui.set_message(message.into()));
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_window(|ui| ui.set_message(message.clone().into()))
+                });
             });
         });
     }
+    ui.on_install_udev_rule(|| {
+        std::thread::spawn(|| {
+            let message = install_udev_rule().unwrap_or_else(|e| e);
+            let _ = slint::invoke_from_event_loop(move || {
+                with_window(|ui| ui.set_message(message.clone().into()))
+            });
+        });
+    });
+    // What the threads have learnt so far.
+    if let Some(s) = runtime.last_state.lock().unwrap().as_ref() {
+        apply_state(&ui, s);
+    }
+    apply_service(&ui, &runtime.last_service.lock().unwrap());
+    Ok(ui)
+}
 
-    // Actions: each request on its own thread, then a state refresh.
-    let act = |ui: &MainWindow, path: String| {
-        let weak = ui.as_weak();
-        std::thread::spawn(move || {
-            let message = post(&path);
-            let refreshed = state().ok();
-            let _ = weak.upgrade_in_event_loop(move |ui| {
-                if let Some(s) = &refreshed {
-                    apply_state(&ui, s);
+/// Shows the window, creating it if needed (UI thread only).
+pub fn show_window(runtime: &Arc<Runtime>) {
+    WINDOW.with(|w| {
+        let mut slot = w.borrow_mut();
+        if slot.is_none() {
+            match build_window(runtime) {
+                Ok(ui) => *slot = Some(ui),
+                Err(error) => {
+                    eprintln!("creating the window: {error}");
+                    return;
                 }
-                ui.set_message(message.into());
-            });
-        });
-    };
-    {
-        let ui_handle = ui.as_weak();
-        ui.on_set_control(move |key, value| {
-            let ui = ui_handle.unwrap();
-            act(&ui, format!("/api/set?{key}={value}"));
-        });
-    }
-    {
-        let ui_handle = ui.as_weak();
-        ui.on_set_range(move |index| act(&ui_handle.unwrap(), format!("/api/set?range={index}")));
-    }
-    {
-        let ui_handle = ui.as_weak();
-        ui.on_set_gain(move |value| act(&ui_handle.unwrap(), format!("/api/set?gain={value}")));
-    }
-    {
-        let ui_handle = ui.as_weak();
-        ui.on_reset_picture(move || act(&ui_handle.unwrap(), "/api/set?reset=1".into()));
-    }
-    {
-        let ui_handle = ui.as_weak();
-        ui.on_toggle_record(move || {
-            let ui = ui_handle.unwrap();
-            let path = if ui.get_recording() {
-                "/api/record?stop=1"
-            } else {
-                "/api/record?start=1"
-            };
-            act(&ui, path.into());
-        });
-    }
-    {
-        let ui_handle = ui.as_weak();
-        ui.on_toggle_stream(move || {
-            let ui = ui_handle.unwrap();
-            let path = if ui.get_stream_on() {
-                "/api/stream?off=1"
-            } else {
-                "/api/stream?on=1"
-            };
-            act(&ui, path.into());
-        });
-    }
-    {
-        let ui_handle = ui.as_weak();
-        ui.on_restore_edid(move || act(&ui_handle.unwrap(), "/api/edid?restore=1".into()));
-    }
-    {
-        let ui_handle = ui.as_weak();
-        ui.on_generate_report(move || {
-            let weak = ui_handle.clone();
-            std::thread::spawn(move || {
-                let report = match api("GET", "/api/report") {
-                    Ok((_, body)) => String::from_utf8_lossy(&body).into_owned(),
-                    Err(error) => error,
-                };
-                let _ = weak.upgrade_in_event_loop(move |ui| ui.set_report_text(report.into()));
-            });
-        });
+            }
+        }
+        if let Some(ui) = slot.as_ref() {
+            let _ = ui.show();
+            ui.window().set_minimized(false);
+            WINDOW_OPEN.store(true, Ordering::Relaxed);
+        }
+    });
+}
+
+fn main() -> Result<(), slint::PlatformError> {
+    let start_in_tray = std::env::args().any(|a| a == "--tray");
+    // The Wayland app id (and X11 class) must match the desktop entry for
+    // the panel to show our icon and group the window.
+    slint::BackendSelector::new()
+        .with_winit_window_attributes_hook(|attributes| {
+            use slint::winit_030::winit::platform::wayland::WindowAttributesExtWayland as W;
+            use slint::winit_030::winit::platform::x11::WindowAttributesExtX11 as X;
+            let attributes = W::with_name(attributes, "hd60s-control", "hd60s-control");
+            X::with_name(attributes, "hd60s-control", "hd60s-control")
+        })
+        .select()?;
+    let config = read_config();
+    let runtime = Arc::new(Runtime {
+        quitting: AtomicBool::new(false),
+        close_to_tray: AtomicBool::new(
+            config
+                .get("close_to_tray")
+                .map(|v| v != "false")
+                .unwrap_or(true),
+        ),
+        factor: AtomicUsize::new(2),
+        busy: AtomicBool::new(false),
+        own: std::sync::Mutex::new(None),
+        last_state: std::sync::Mutex::new(None),
+        last_service: std::sync::Mutex::new(ServiceView::default()),
+    });
+    let tray_handle = tray::start(runtime.clone());
+    if tray_handle.is_none() && start_in_tray {
+        eprintln!("no tray available; showing the window instead");
     }
 
-    // State once a second; the service's systemd status every fifth time.
+    // State once a second; service, autostart and device access every fifth time.
     {
-        let weak = ui.as_weak();
-        let own = own.clone();
+        let runtime = runtime.clone();
         let tray_handle = tray_handle.clone();
         std::thread::spawn(move || {
             let mut tick = 0_u32;
@@ -576,18 +744,14 @@ fn main() -> Result<(), slint::PlatformError> {
             loop {
                 let result = state();
                 if result.is_ok() {
-                    // Should the service go away later (the unit disabled
-                    // from the Service box, say), run our own again.
                     tried_own = false;
                 }
-                if result.is_err() && !tried_own && own.lock().unwrap().is_none() {
-                    // Nothing answers: unless systemd is meant to run it, run it ourselves.
+                if result.is_err() && !tried_own && runtime.own.lock().unwrap().is_none() {
                     tried_own = true;
-                    let enabled = systemctl(&["is-enabled"]).unwrap_or_default();
-                    if enabled != "enabled"
+                    if systemctl(&["is-enabled"]).unwrap_or_default() != "enabled"
                         && let Ok(child) = start_own_service()
                     {
-                        *own.lock().unwrap() = Some(child);
+                        *runtime.own.lock().unwrap() = Some(child);
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
                     }
@@ -596,90 +760,90 @@ fn main() -> Result<(), slint::PlatformError> {
                     let snapshot = result.as_ref().ok().cloned();
                     handle.update(|tray| tray.apply(snapshot.as_ref()));
                 }
+                if let Ok(s) = &result {
+                    *runtime.last_state.lock().unwrap() = Some(s.clone());
+                }
                 if tick.is_multiple_of(5) {
                     let enabled = systemctl(&["is-enabled"]).unwrap_or_default();
-                    let mode = autostart_mode();
                     let active = systemctl(&["is-active"]).unwrap_or_default() == "active";
-                    let own_running = own.lock().unwrap().is_some();
-                    let text = match (active, own_running, result.is_ok()) {
-                        (true, _, _) => "running as systemd user service".to_string(),
-                        (false, true, true) => {
-                            "running, started by this program (ends with it)".to_string()
-                        }
-                        (false, true, false) => "starting…".to_string(),
-                        (false, false, true) => "running elsewhere".to_string(),
-                        (false, false, false) => format!("not running (unit {enabled})"),
+                    let own_running = runtime.own.lock().unwrap().is_some();
+                    let (access_text, access_fixable) = match device_access() {
+                        Access::Denied(node) => (
+                            format!("A card is plugged in but you may not open {node}: the udev access rule is missing."),
+                            true,
+                        ),
+                        Access::NoCard if !udev_rule_installed() => (
+                            "No udev access rule is installed yet; without it the card cannot be opened by your user.".to_string(),
+                            true,
+                        ),
+                        _ => (String::new(), false),
                     };
-                    let running = result.is_ok();
-                    let _ = weak.upgrade_in_event_loop(move |ui| {
-                        ui.set_service_text(text.into());
-                        ui.set_autostart_index(mode as i32);
-                        ui.set_autostart_hint(
-                            match mode {
-                                1 => "sway users: add `exec hd60s-control --tray` to the sway config instead.",
-                                2 => "The unit keeps running when this program is closed.",
-                                _ => "",
+                    let view = ServiceView {
+                        text: match (active, own_running, result.is_ok()) {
+                            (true, _, _) => "running as systemd user service".to_string(),
+                            (false, true, true) => {
+                                "running, started by this program (ends with it)".to_string()
                             }
-                            .into(),
-                        );
-                        ui.set_service_running(running);
+                            (false, true, false) => "starting…".to_string(),
+                            (false, false, true) => "running elsewhere".to_string(),
+                            (false, false, false) => format!("not running (unit {enabled})"),
+                        },
+                        autostart: autostart_mode(),
+                        running: result.is_ok(),
+                        access_text,
+                        access_fixable,
+                    };
+                    *runtime.last_service.lock().unwrap() = view.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        with_window(|ui| apply_service(ui, &view))
                     });
                 }
-                tick += 1;
-                let done = weak
-                    .upgrade_in_event_loop(move |ui| match &result {
-                        Ok(s) => apply_state(&ui, s),
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_window(|ui| match &result {
+                        Ok(s) => apply_state(ui, s),
                         Err(error) => {
                             ui.set_connected(false);
                             ui.set_device_present(false);
                             ui.set_headline(error.clone().into());
                         }
                     })
-                    .is_err();
-                if done {
-                    break;
-                }
+                });
+                tick += 1;
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
     }
 
-    // Live picture: the latest frame, converted here, about 30 times a second.
+    // Live picture: the latest frame, converted here, about 30 times a
+    // second while a window exists.
     {
-        let weak = ui.as_weak();
-        let busy = busy.clone();
-        let factor = factor.clone();
+        let runtime = runtime.clone();
         std::thread::spawn(move || {
-            let mut last_len = 0;
             loop {
                 let started = Instant::now();
-                if !busy.load(Ordering::Relaxed)
+                let wanted = WINDOW_OPEN.load(Ordering::Relaxed);
+                if wanted
+                    && !runtime.busy.load(Ordering::Relaxed)
                     && let Ok((200, frame)) = api("GET", "/frame.yuyv")
                     && frame.len() == WIDTH * HEIGHT * 2
                 {
-                    last_len = frame.len();
-                    let rgb = yuyv_to_rgb(&frame, factor.load(Ordering::Relaxed).max(1));
-                    busy.store(true, Ordering::Relaxed);
-                    let busy_done = busy.clone();
-                    let factor_out = factor.clone();
-                    if weak
-                        .upgrade_in_event_loop(move |ui| {
-                            ui.set_preview(Image::from_rgb8(rgb));
-                            // Full size only when the widget can show it.
-                            let wanted = if ui.get_preview_width() >= 1500.0 {
+                    let rgb = yuyv_to_rgb(&frame, runtime.factor.load(Ordering::Relaxed).max(1));
+                    runtime.busy.store(true, Ordering::Relaxed);
+                    let runtime_ui = runtime.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        with_window(|ui| {
+                            ui.set_preview(Image::from_rgb8(rgb.clone()));
+                            let factor = if ui.get_preview_width() >= 1500.0 {
                                 1
                             } else {
                                 2
                             };
-                            factor_out.store(wanted, Ordering::Relaxed);
-                            busy_done.store(false, Ordering::Relaxed);
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                } else if last_len == 0 {
-                    std::thread::sleep(Duration::from_millis(500));
+                            runtime_ui.factor.store(factor, Ordering::Relaxed);
+                        });
+                        runtime_ui.busy.store(false, Ordering::Relaxed);
+                    });
+                } else if !wanted {
+                    std::thread::sleep(Duration::from_millis(300));
                 }
                 if let Some(rest) = Duration::from_millis(33).checked_sub(started.elapsed()) {
                     std::thread::sleep(rest);
@@ -688,11 +852,15 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    if !start_in_tray {
-        ui.show()?;
+    if !start_in_tray || tray_handle.is_none() {
+        show_window(&runtime);
     }
     let result = slint::run_event_loop_until_quit();
     // Our own service, if any, ends with the program.
-    own.lock().unwrap().take();
+    runtime.own.lock().unwrap().take();
     result
 }
+
+/// Whether a window exists, for the frame thread (it must not touch the
+/// thread-local from another thread).
+static WINDOW_OPEN: AtomicBool = AtomicBool::new(false);
