@@ -100,11 +100,43 @@ back — a USB reset is not enough — then use a current build.
 The panel's record button and the tray menu write the stream to a file:
 `ffmpeg` encodes the 1920x1080 frames and the audio to H.264 + AAC in a
 Matroska file named `HD60 S <date> <time>.mkv` in your Videos directory
-(`--record-dir DIR` changes that; `--record-encoder vaapi` uses the GPU's
-VA-API encoder instead of libx264). Frames the encoder cannot keep up with
+(`--record-dir DIR` changes that). The encoder is chosen automatically: the
+GPU's VA-API H.264 encoder when a test encode on `/dev/dri/renderD128`
+succeeds (Intel, AMD), libx264 otherwise; `--record-encoder x264|vaapi`
+forces one, and the panel shows which is in use. Frames the encoder cannot keep up with
 are dropped and counted rather than stalling the capture; the file is
 playable even if the service is killed while recording. `ffmpeg` must be
 installed. Scripts use `POST /api/record?start=1` and `?stop=1`.
+
+### Network stream (for Frigate, go2rtc, another machine)
+
+Off by default. Switched on from the panel or the tray, `serve` also serves
+the picture as Motion JPEG on **port 8061 on all interfaces**:
+`http://<host>:8061/stream.mjpg` (default 15 fps at 960x540; `?fps=30`,
+`?scale=1` for full size, `?quality=90`), `http://<host>:8061/snapshot.jpg`
+and a bare viewer page at `/`. There is no authentication — use it on a
+trusted network only. `--stream on` starts with it switched on,
+`--stream-bind ADDR` moves it, `--stream-bind off` removes it, and
+`--stream-fps N` / `--stream-scale N` change the defaults. Every client gets
+its own encoder thread (a 960x540 JPEG costs about 14 ms of one core).
+
+Frigate, through its bundled go2rtc, takes it like this:
+
+```yaml
+go2rtc:
+  streams:
+    hd60s:
+      - "ffmpeg:http://buzzdeegaming:8061/stream.mjpg#video=h264#hardware"
+cameras:
+  hd60s:
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/hd60s
+          roles: [detect, record]
+```
+
+or directly as an ffmpeg input (`- path: http://buzzdeegaming:8061/stream.mjpg`
+with `input_args: -f mjpeg -re`) without go2rtc.
 
 ### Tray icon
 

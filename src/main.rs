@@ -1117,12 +1117,24 @@ fn main() -> ExitCode {
             Some(name) => match hd60s_linux::record::Encoder::parse(&name) {
                 Some(encoder) => encoder,
                 None => {
-                    eprintln!("error: --record-encoder must be x264 or vaapi");
+                    eprintln!("error: --record-encoder must be auto, x264 or vaapi");
                     return ExitCode::FAILURE;
                 }
             },
-            None => hd60s_linux::record::Encoder::X264,
+            None => hd60s_linux::record::Encoder::Auto,
         };
+        let stream_on = matches!(option("--stream").as_deref(), Some("on"));
+        let stream_bind = match option("--stream-bind").as_deref() {
+            Some("off") | Some("none") => None,
+            Some(address) => Some(address.to_string()),
+            None => Some("0.0.0.0:8061".to_string()),
+        };
+        let stream_fps = option("--stream-fps")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15);
+        let stream_scale = option("--stream-scale")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
         return match serve(
             &name,
             source,
@@ -1131,6 +1143,10 @@ fn main() -> ExitCode {
                 tray,
                 record_dir,
                 record_encoder,
+                stream_bind,
+                stream_on,
+                stream_fps,
+                stream_scale,
             },
         ) {
             Ok(()) => ExitCode::SUCCESS,
@@ -1146,7 +1162,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "error: usage: hd60s-linux [status|signal|picture|audio|edid|mcu|report|serve|observe|observe-stream|observe-iso|capture] \\
                  [SECONDS] [--audio FILE] [--native]\n       picture [--range bypass|shrink|expand] \\
-                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]\n       serve [--name NAME] [--panel ADDR|off] [--tray off] [--record-dir DIR] [--record-encoder x264|vaapi] [--from-file RAW [--fps N]]\n       report [--show-serial] [--no-capture]"
+                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]\n       serve [--name NAME] [--panel ADDR|off] [--tray off] [--record-dir DIR] [--record-encoder auto|x264|vaapi] [--stream on|off] [--stream-bind ADDR|off] [--stream-fps N] [--stream-scale N] [--from-file RAW [--fps N]]\n       report [--show-serial] [--no-capture]"
             );
             return ExitCode::FAILURE;
         }

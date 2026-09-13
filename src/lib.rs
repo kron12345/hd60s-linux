@@ -7,5 +7,6 @@ pub mod pump;
 pub mod record;
 pub mod report;
 pub mod serve;
+pub mod stream;
 pub mod trace;
 pub mod tray;

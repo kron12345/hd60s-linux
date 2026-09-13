@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encoder {
+    /// VA-API when a quick test encode succeeds, libx264 otherwise.
+    Auto,
     /// libx264, preset veryfast, CRF 20 — works everywhere.
     X264,
     /// H.264 through VA-API on /dev/dri/renderD128 (Intel/AMD).
@@ -23,12 +25,60 @@ pub enum Encoder {
 impl Encoder {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
+            "auto" => Some(Self::Auto),
             "x264" | "software" => Some(Self::X264),
             "vaapi" => Some(Self::Vaapi),
             _ => None,
         }
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::X264 => "x264",
+            Self::Vaapi => "vaapi",
+        }
+    }
+
+    /// Turns `Auto` into a concrete encoder by encoding one frame with
+    /// VA-API (256x256: the encoders want at least 128 pixels a side); takes
+    /// well under a second.
+    pub fn resolve(self) -> Encoder {
+        if self != Self::Auto {
+            return self;
+        }
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-vaapi_device",
+                VAAPI_DEVICE,
+                "-f",
+                "lavfi",
+                "-i",
+                "color=size=256x256:rate=1",
+                "-frames:v",
+                "1",
+                "-vf",
+                "format=nv12,hwupload",
+                "-c:v",
+                "h264_vaapi",
+                "-f",
+                "null",
+                "-",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if ok { Self::Vaapi } else { Self::X264 }
+    }
 }
+
+const VAAPI_DEVICE: &str = "/dev/dri/renderD128";
 
 /// What the panel and the tray show about a running or finished recording.
 #[derive(Clone, Debug)]
@@ -42,7 +92,8 @@ pub struct Status {
 pub struct Recording {
     path: PathBuf,
     started: Instant,
-    video: Option<SyncSender<Vec<u8>>>,
+    pub encoder: Encoder,
+    video: Option<SyncSender<Arc<Vec<u8>>>>,
     audio: Option<SyncSender<Vec<u8>>>,
     dropped: Arc<AtomicU64>,
     child: Child,
@@ -78,6 +129,7 @@ impl Recording {
         width: usize,
         height: usize,
     ) -> Result<Self, String> {
+        let encoder = encoder.resolve();
         std::fs::create_dir_all(dir)
             .map_err(|error| format!("creating {}: {error}", dir.display()))?;
         let path = dir.join(format!("HD60 S {}.mkv", timestamp()));
@@ -118,7 +170,7 @@ impl Recording {
             .args(["-f", "s16le", "-ar", "48000", "-ac", "2", "-i"])
             .arg(&fifo);
         match encoder {
-            Encoder::X264 => {
+            Encoder::Auto | Encoder::X264 => {
                 command.args([
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
                 ]);
@@ -126,7 +178,7 @@ impl Recording {
             Encoder::Vaapi => {
                 command.args([
                     "-vaapi_device",
-                    "/dev/dri/renderD128",
+                    VAAPI_DEVICE,
                     "-vf",
                     "format=nv12,hwupload",
                     "-c:v",
@@ -158,7 +210,7 @@ impl Recording {
         let mut stdin = child.stdin.take().ok_or("ffmpeg stdin")?;
 
         let dropped = Arc::new(AtomicU64::new(0));
-        let (video_tx, video_rx) = sync_channel::<Vec<u8>>(8);
+        let (video_tx, video_rx) = sync_channel::<Arc<Vec<u8>>>(8);
         let (audio_tx, audio_rx) = sync_channel::<Vec<u8>>(4096);
         let video_thread = std::thread::spawn(move || {
             while let Ok(frame) = video_rx.recv() {
@@ -181,6 +233,7 @@ impl Recording {
         });
         Ok(Self {
             path,
+            encoder,
             started: Instant::now(),
             video: Some(video_tx),
             audio: Some(audio_tx),
@@ -191,9 +244,9 @@ impl Recording {
         })
     }
 
-    pub fn push_frame(&self, pixels: &[u8]) {
+    pub fn push_frame(&self, pixels: Arc<Vec<u8>>) {
         if let Some(video) = &self.video {
-            match video.try_send(pixels.to_vec()) {
+            match video.try_send(pixels) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     self.dropped.fetch_add(1, Ordering::Relaxed);

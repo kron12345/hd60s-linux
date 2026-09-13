@@ -42,8 +42,9 @@
         <dt>Input</dt><dd id="timing">–</dd>
         <dt>Stream</dt><dd id="stream">–</dd>
         <dt>Recording</dt><dd id="recording">off</dd>
+        <dt>Network stream</dt><dd id="netstream">–</dd>
       </div>
-      <div class="buttons"><button id="recbtn">● Start recording</button></div>
+      <div class="buttons"><button id="recbtn">● Start recording</button><button id="streambtn" hidden>Switch network stream on</button></div>
     </div>
     <div class="card" style="margin-top:14px">
       <h2>Picture</h2>
@@ -97,7 +98,8 @@ for (const id of sliders.concat(["gain"])) {
 }
 $("range").addEventListener("change", () => post(`/api/set?range=${$("range").value}`));
 $("reset").addEventListener("click", () => post(`/api/set?reset=1`));
-let recording = false;
+let recording = false, streamOn = false;
+$("streambtn").addEventListener("click", () => post(streamOn ? "/api/stream?off=1" : "/api/stream?on=1").then(refresh));
 $("recbtn").addEventListener("click", () => post(recording ? "/api/record?stop=1" : "/api/record?start=1").then(refresh));
 $("edidrestore").addEventListener("click", () => post(`/api/edid?restore=1`));
 $("reportbtn").addEventListener("click", async () => { const t = await (await fetch("/api/report")).text(); $("report").textContent = t; $("report").hidden = false; });
@@ -127,7 +129,13 @@ async function refresh(){
     recording = !!s.recording;
     $("recbtn").textContent = recording ? "■ Stop recording" : "● Start recording";
     $("recbtn").style.color = recording ? "var(--bad)" : "";
-    $("recording").textContent = s.recording ? `${s.recording.path} · ${Math.floor(s.recording.seconds/60)}:${String(Math.floor(s.recording.seconds%60)).padStart(2,"0")} · ${(s.recording.bytes/1e6).toFixed(0)} MB · ${s.recording.dropped} dropped` : `off · files go to ${s.record_dir}`;
+    if (s.network_stream) {
+      streamOn = s.network_stream.enabled;
+      $("streambtn").hidden = false;
+      $("streambtn").textContent = streamOn ? "Switch network stream off" : "Switch network stream on";
+      $("netstream").textContent = streamOn ? `on · ${s.network_stream.url} · ${s.network_stream.clients} client(s) · ${s.network_stream.fps} fps, 1/${s.network_stream.scale} size` : `off (would be ${s.network_stream.url})`;
+    } else { $("netstream").textContent = "not configured"; }
+    $("recording").textContent = s.recording ? `${s.recording.path} · ${Math.floor(s.recording.seconds/60)}:${String(Math.floor(s.recording.seconds%60)).padStart(2,"0")} · ${(s.recording.bytes/1e6).toFixed(0)} MB · ${s.recording.dropped} dropped` : `off · files go to ${s.record_dir} · encoder ${s.encoder}`;
   } catch (e) { $("devtext").textContent = "panel unreachable"; $("devdot").className = "dot bad"; }
 }
 function refreshPreview(){ const img = $("preview"); const next = new Image(); next.onload = () => { img.src = next.src; }; next.src = "/preview.jpg?t=" + Date.now(); }

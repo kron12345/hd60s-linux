@@ -41,7 +41,7 @@ const AUDIO_RING_BYTES: usize = (AUDIO_RATE * AUDIO_CHANNELS * 2) as usize;
 
 /// State shared between the pump, the PipeWire threads and the panel.
 pub struct Shared {
-    pub latest: Mutex<Option<Vec<u8>>>,
+    pub latest: Mutex<Option<Arc<Vec<u8>>>>,
     pub audio: Mutex<VecDeque<u8>>,
     pub stop: AtomicBool,
     pub stats: Arc<Mutex<frame::Stats>>,
@@ -66,6 +66,14 @@ pub struct Shared {
     pub recording: Mutex<Option<Recording>>,
     pub record_dir: std::path::PathBuf,
     pub record_encoder: record::Encoder,
+    /// The encoder actually used once `Auto` has been probed.
+    pub resolved_encoder: Mutex<Option<record::Encoder>>,
+    /// The optional MJPEG stream for other machines: switch and address.
+    pub network_stream: AtomicBool,
+    pub stream_bind: Option<String>,
+    pub stream_fps: u32,
+    pub stream_scale: usize,
+    pub stream_clients: std::sync::atomic::AtomicUsize,
 }
 
 impl Shared {
@@ -78,14 +86,17 @@ impl Shared {
         if !self.device_present.load(Ordering::Relaxed) {
             return Err("nothing to record: no stream".into());
         }
-        let recording = Recording::start(
-            &self.record_dir,
-            self.record_encoder,
-            CANVAS_WIDTH,
-            CANVAS_HEIGHT,
-        )?;
+        let encoder = {
+            let mut resolved = self.resolved_encoder.lock().unwrap();
+            *resolved.get_or_insert_with(|| self.record_encoder.resolve())
+        };
+        let recording = Recording::start(&self.record_dir, encoder, CANVAS_WIDTH, CANVAS_HEIGHT)?;
         let status = recording.status();
-        eprintln!("recording to {}", status.path.display());
+        eprintln!(
+            "recording to {} (encoder {})",
+            status.path.display(),
+            recording.encoder.name()
+        );
         *slot = Some(recording);
         Ok(status)
     }
@@ -180,6 +191,12 @@ pub struct Options {
     pub tray: bool,
     pub record_dir: std::path::PathBuf,
     pub record_encoder: record::Encoder,
+    /// Address for the MJPEG stream; `None` leaves the feature out.
+    pub stream_bind: Option<String>,
+    /// Whether the stream starts switched on.
+    pub stream_on: bool,
+    pub stream_fps: u32,
+    pub stream_scale: usize,
 }
 
 pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String> {
@@ -188,6 +205,10 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
         tray,
         record_dir,
         record_encoder,
+        stream_bind,
+        stream_on,
+        stream_fps,
+        stream_scale,
     } = options;
     pw::init();
     let shared = Arc::new(Shared {
@@ -207,7 +228,21 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
         recording: Mutex::new(None),
         record_dir,
         record_encoder,
+        resolved_encoder: Mutex::new(None),
+        network_stream: AtomicBool::new(stream_on),
+        stream_bind: stream_bind.clone(),
+        stream_fps,
+        stream_scale,
+        stream_clients: std::sync::atomic::AtomicUsize::new(0),
     });
+    if let Some(address) = stream_bind {
+        let stream_shared = shared.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = crate::stream::run(&address, stream_shared) {
+                eprintln!("network stream: {error}");
+            }
+        });
+    }
     if let Some(address) = &panel {
         let panel_shared = shared.clone();
         let address = address.clone();
@@ -231,9 +266,9 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
         let on_frame = |shared: &Shared, frame: frame::Frame| {
             *shared.geometry.lock().unwrap() = (frame.width, frame.height);
             shared.note_frame();
-            let pixels = letterbox(frame, CANVAS_WIDTH, CANVAS_HEIGHT);
+            let pixels = Arc::new(letterbox(frame, CANVAS_WIDTH, CANVAS_HEIGHT));
             if let Some(recording) = shared.recording.lock().unwrap().as_ref() {
-                recording.push_frame(&pixels);
+                recording.push_frame(pixels.clone());
             }
             *shared.latest.lock().unwrap() = Some(pixels);
         };
@@ -418,7 +453,7 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
                 return;
             }
             let latest = fill_shared.latest.lock().unwrap();
-            match (latest.as_deref(), frame.format) {
+            match (latest.as_ref().map(|p| p.as_slice()), frame.format) {
                 (Some(pixels), Format::Yuy2)
                     if pixels.len() == CANVAS_WIDTH * CANVAS_HEIGHT * 2 =>
                 {

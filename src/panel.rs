@@ -35,25 +35,25 @@ pub fn run(address: &str, shared: Arc<Shared>) -> Result<(), String> {
     Ok(())
 }
 
-struct Request {
-    method: String,
-    path: String,
+pub(crate) struct Request {
+    pub method: String,
+    pub path: String,
     query: Vec<(String, String)>,
 }
 
 impl Request {
-    fn get(&self, key: &str) -> Option<&str> {
+    pub fn get(&self, key: &str) -> Option<&str> {
         self.query
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     }
-    fn number(&self, key: &str) -> Option<u8> {
+    pub fn number(&self, key: &str) -> Option<u8> {
         self.get(key).and_then(|v| v.parse::<u8>().ok())
     }
 }
 
-fn parse(stream: &mut TcpStream) -> Option<Request> {
+pub(crate) fn parse(stream: &mut TcpStream) -> Option<Request> {
     let mut buffer = [0_u8; 8192];
     let mut data = Vec::new();
     loop {
@@ -115,7 +115,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
+pub(crate) fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
@@ -174,6 +174,37 @@ fn state_json(shared: &Shared) -> String {
         "\"record_dir\":{}",
         json_string(&shared.record_dir.display().to_string())
     ));
+    fields.push(format!(
+        "\"encoder\":{}",
+        json_string(
+            shared
+                .resolved_encoder
+                .lock()
+                .unwrap()
+                .map(|e| e.name())
+                .unwrap_or(shared.record_encoder.name())
+        )
+    ));
+    match &shared.stream_bind {
+        Some(bind) => {
+            let host = std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|h| !h.is_empty())
+                .unwrap_or_else(|| "localhost".into());
+            let port = bind.rsplit(':').next().unwrap_or("8061");
+            fields.push(format!(
+                "\"network_stream\":{{\"enabled\":{},\"url\":{},\"clients\":{},\"fps\":{},\"scale\":{}}}",
+                shared.network_stream.load(Ordering::Relaxed),
+                json_string(&format!("http://{host}:{port}/stream.mjpg")),
+                shared.stream_clients.load(Ordering::Relaxed),
+                shared.stream_fps,
+                shared.stream_scale
+            ));
+        }
+        None => fields.push("\"network_stream\":null".to_string()),
+    }
     let control = shared.control.lock().unwrap();
     let snapshot = shared.snapshot.lock().unwrap();
     match control.as_ref() {
@@ -302,6 +333,12 @@ fn apply(shared: &Shared, request: &Request) -> Result<String, String> {
 /// reduced by an integer factor with a box filter (BT.709, limited range).
 fn preview(shared: &Shared, factor: usize, quality: u8) -> Option<Vec<u8>> {
     let frame = shared.latest.lock().unwrap().clone()?;
+    jpeg_from_yuyv(&frame, factor, quality)
+}
+
+/// A 1920x1080 YUYV frame as JPEG, at full size or reduced by an integer
+/// factor with a box filter (BT.709, limited range).
+pub fn jpeg_from_yuyv(frame: &[u8], factor: usize, quality: u8) -> Option<Vec<u8>> {
     const SRC_W: usize = crate::frame::MAX_WIDTH;
     const SRC_H: usize = crate::frame::MAX_HEIGHT;
     if frame.len() != SRC_W * SRC_H * 2 {
@@ -422,6 +459,21 @@ fn handle(mut stream: TcpStream, shared: Arc<Shared>) {
                     format!("{{\"ok\":false,\"error\":{}}}", json_string(&error)).as_bytes(),
                 ),
             }
+        }
+        ("POST", "/api/stream") => {
+            let on = request.get("on").is_some();
+            shared.network_stream.store(on, Ordering::Relaxed);
+            eprintln!("network stream switched {}", if on { "on" } else { "off" });
+            respond(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                format!(
+                    "{{\"ok\":true,\"message\":\"network stream {}\"}}",
+                    if on { "on" } else { "off" }
+                )
+                .as_bytes(),
+            )
         }
         ("GET", "/edid.bin") => {
             let block = shared

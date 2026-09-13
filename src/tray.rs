@@ -31,6 +31,7 @@ pub struct Tray {
     range: usize,
     device_known: bool,
     recording: Option<crate::record::Status>,
+    network_stream: bool,
 }
 
 impl Tray {
@@ -51,6 +52,7 @@ impl Tray {
         let stats = *self.shared.stats.lock().unwrap();
         let geometry = *self.shared.geometry.lock().unwrap();
         self.recording = self.shared.recording_status();
+        self.network_stream = self.shared.network_stream.load(Ordering::Relaxed);
         // Without a control connection (a replayed recording) the stream
         // geometry stands in for the timing registers.
         let signal = match &timing {
@@ -204,6 +206,18 @@ impl ksni::Tray for Tray {
                 }),
                 ..Default::default()
             }),
+            MenuItem::Checkmark(CheckmarkItem {
+                label: "Network stream (MJPEG)".into(),
+                checked: self.network_stream,
+                visible: self.shared.stream_bind.is_some(),
+                activate: Box::new(|tray: &mut Self| {
+                    let on = !tray.network_stream;
+                    tray.shared.network_stream.store(on, Ordering::Relaxed);
+                    eprintln!("network stream switched {}", if on { "on" } else { "off" });
+                    tray.refresh();
+                }),
+                ..Default::default()
+            }),
             MenuItem::Separator,
             MenuItem::Checkmark(CheckmarkItem {
                 label: "Mute audio".into(),
@@ -274,6 +288,7 @@ pub fn run(shared: Arc<Shared>, panel_url: Option<String>) {
         range: 0,
         device_known: false,
         recording: None,
+        network_stream: false,
     };
     tray.refresh();
     let handle = match tray.spawn() {
