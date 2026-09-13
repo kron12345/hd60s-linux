@@ -224,7 +224,11 @@ private (they contain the serial and captured video).
   - The application never rewrites the EDID for any setting; it does not
     force an input resolution on the source.
   - `hd60s-linux picture` reads and writes these two registers from Linux
-    with the same requests.
+    with the same requests. **These controls also change the picture on the
+    HDMI pass-through output** (observed on a monitor attached to it): the
+    pass-through is not an electrical loop-through but leaves the same
+    processing stage as the capture. Keep them neutral if someone plays on
+    the pass-through monitor and correct the picture downstream instead.
 - Before starting, the application reads the **EDID from bank `0xa0`**
   (256 bytes as 16 reads of 16 bytes at `wIndex` 0, 16, … 240), writes it
   back, then writes a version with the monitor name changed from "Elgato" to
