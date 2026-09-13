@@ -6,6 +6,8 @@ pkgdesc="Elgato Game Capture HD60 S as a PipeWire camera and microphone (userspa
 arch=('x86_64' 'aarch64')
 url="https://github.com/kron12345/hd60s-linux"
 license=('MIT')
+# The libspa-sys C shim must not be compiled with GCC LTO: Rust links with lld.
+options=(!lto)
 depends=('libpipewire' 'libusb' 'pipewire')
 makedepends=('git' 'cargo' 'clang' 'pkgconf')
 provides=('hd60s-linux')
