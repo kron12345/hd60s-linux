@@ -352,7 +352,7 @@ fn audio_source(name: &str, shared: Arc<Shared>) -> Result<(), String> {
         }
         ticks.set(ticks.get() + 1);
         // A line every 30 s is enough to see that audio moves.
-        if ticks.get() % 150 == 0 {
+        if ticks.get().is_multiple_of(150) {
             let (calls, bytes, unmapped) = counters_timer.get();
             let queued = stop_shared.audio.lock().unwrap().len();
             eprintln!("audio: {calls} process call(s), {bytes} byte(s) delivered, {unmapped} unmapped, {queued} queued");
