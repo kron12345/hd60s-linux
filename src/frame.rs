@@ -1,26 +1,54 @@
 //! Splits the raw HD60 S bulk stream into frames and embedded audio.
 //!
-//! Stream layout, measured on a Rev. 4 device:
+//! Stream layout, measured on a Rev. 4 device across 1080p60/50/30, 720p60,
+//! 1280x1024, 576p50 and 480p60 sources:
 //!
 //! ```text
-//! <TRS ff 00 00 XY> <3840 B pixels, YUYV> [<12 B audio block>] <next TRS> ...
+//! <TRS ff 00 00 XY> <width*2 B pixels, YUYV> [<ff 00 ff N> <N stereo samples>]... <next TRS> ...
 //! ```
 //!
 //! `XY` follows BT.656: bit 7 is always set, followed by F, V and H, and the
 //! low four bits are protection bits derived from F/V/H. That parity reliably
 //! separates real markers from a chance `ff 00 00` inside pixel data.
 //!
-//! A frame spans 1125 lines, 1080 of them active. It starts where V changes
-//! from 1 (vertical blanking) to 0.
+//! A frame starts where V changes from 1 (vertical blanking) to 0. Its width
+//! is the pixel payload of its lines, its height the number of active lines,
+//! so the geometry follows the source without any configuration.
 
-pub const WIDTH: usize = 1920;
-pub const HEIGHT: usize = 1080;
-pub const LINE_BYTES: usize = WIDTH * 2;
-pub const FRAME_BYTES: usize = HEIGHT * LINE_BYTES;
+/// Width of the largest picture the device delivers.
+pub const MAX_WIDTH: usize = 1920;
+/// Height of the largest picture the device delivers.
+pub const MAX_HEIGHT: usize = 1080;
 
 const TRS_PREFIX: [u8; 3] = [0xff, 0x00, 0x00];
-const AUDIO_PREFIX: [u8; 4] = [0xff, 0x00, 0xff, 0x02];
-const AUDIO_BLOCK: usize = 12;
+/// Audio trailer header: `ff 00 ff N`, followed by N stereo sample pairs of
+/// 4 bytes. N is 2 on most lines; sources with fewer lines per frame than the
+/// audio needs (720p60) also use 3.
+const AUDIO_PREFIX: [u8; 3] = [0xff, 0x00, 0xff];
+const MAX_AUDIO_PAIRS: usize = 16;
+
+/// Splits the audio trailers off the end of a line. Returns the pixel length
+/// and the trailers' payloads in stream order.
+fn split_audio(line: &[u8]) -> (usize, Vec<&[u8]>) {
+    let mut end = line.len();
+    let mut blocks = Vec::new();
+    'outer: loop {
+        for pairs in 1..=MAX_AUDIO_PAIRS {
+            let len = 4 + 4 * pairs;
+            if end >= len
+                && line[end - len..end - len + 3] == AUDIO_PREFIX
+                && line[end - len + 3] as usize == pairs
+            {
+                blocks.push(&line[end - len + 4..end]);
+                end -= len;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+    blocks.reverse();
+    (end, blocks)
+}
 
 /// Checks the BT.656 protection bits of a status byte.
 fn valid_status(xy: u8) -> bool {
@@ -38,10 +66,16 @@ fn is_blanking(xy: u8) -> bool {
     (xy >> 5) & 1 == 1
 }
 
+/// One complete picture in YUYV.
+pub struct Frame {
+    pub width: usize,
+    pub height: usize,
+    pub pixels: Vec<u8>,
+}
+
 /// What the assembler extracts from the stream.
 pub enum Event {
-    /// One complete picture, 1920x1080 in YUYV.
-    Frame(Vec<u8>),
+    Frame(Frame),
     /// Raw audio bytes, 16-bit little-endian, stereo, interleaved.
     Audio(Vec<u8>),
 }
@@ -50,10 +84,12 @@ pub enum Event {
 #[derive(Default, Clone, Copy)]
 pub struct Stats {
     pub frames: u64,
-    pub short_frames: u64,
+    /// Frames whose lines disagreed on their width, or that had no lines.
+    pub bad_frames: u64,
     pub audio_blocks: u64,
     pub unknown_blocks: u64,
-    pub resyncs: u64,
+    /// Frames whose geometry differed from the previous frame's.
+    pub format_changes: u64,
 }
 
 pub struct Assembler {
@@ -62,6 +98,9 @@ pub struct Assembler {
     synced: bool,
     prev_blanking: bool,
     active_lines: usize,
+    line_bytes: Option<usize>,
+    consistent: bool,
+    last_geometry: Option<(usize, usize)>,
     pub stats: Stats,
 }
 
@@ -75,10 +114,13 @@ impl Assembler {
     pub fn new() -> Self {
         Self {
             buffer: Vec::with_capacity(8 << 20),
-            frame: Vec::with_capacity(FRAME_BYTES),
+            frame: Vec::with_capacity(MAX_WIDTH * MAX_HEIGHT * 2),
             synced: false,
             prev_blanking: false,
             active_lines: 0,
+            line_bytes: None,
+            consistent: true,
+            last_geometry: None,
             stats: Stats::default(),
         }
     }
@@ -101,6 +143,32 @@ impl Assembler {
         None
     }
 
+    fn finish_frame(&mut self, emit: &mut impl FnMut(Event)) {
+        let width = self.line_bytes.unwrap_or(0) / 2;
+        let height = self.active_lines;
+        if self.consistent && width > 0 && height > 0 {
+            let geometry = (width, height);
+            if self.last_geometry.is_some_and(|last| last != geometry) {
+                self.stats.format_changes += 1;
+            }
+            self.last_geometry = Some(geometry);
+            self.stats.frames += 1;
+            let pixels = std::mem::take(&mut self.frame);
+            emit(Event::Frame(Frame {
+                width,
+                height,
+                pixels,
+            }));
+            self.frame = Vec::with_capacity(width * height * 2);
+        } else {
+            self.stats.bad_frames += 1;
+            self.frame.clear();
+        }
+        self.active_lines = 0;
+        self.line_bytes = None;
+        self.consistent = true;
+    }
+
     /// Consumes new bulk data and reports every completed event.
     pub fn push(&mut self, data: &[u8], mut emit: impl FnMut(Event)) {
         self.buffer.extend_from_slice(data);
@@ -120,45 +188,42 @@ impl Assembler {
         while let Some(next) = self.next_trs(cursor + 4) {
             let xy = self.buffer[cursor + 3];
             let blanking = is_blanking(xy);
-            let body = &self.buffer[cursor + 4..next];
 
             // A frame starts where vertical blanking ends.
-            if self.synced && self.prev_blanking && !blanking {
-                if self.active_lines == HEIGHT {
-                    self.stats.frames += 1;
-                    emit(Event::Frame(std::mem::take(&mut self.frame)));
+            if self.prev_blanking && !blanking {
+                if self.synced {
+                    self.finish_frame(&mut emit);
                 } else {
-                    self.stats.short_frames += 1;
+                    self.synced = true;
+                    self.frame.clear();
+                    self.active_lines = 0;
+                    self.line_bytes = None;
+                    self.consistent = true;
                 }
-                self.frame = Vec::with_capacity(FRAME_BYTES);
-                self.active_lines = 0;
-            } else if !self.synced && self.prev_blanking && !blanking {
-                self.synced = true;
-                self.frame.clear();
-                self.active_lines = 0;
             }
 
-            // Excess bytes at the end of a line are the embedded audio block.
-            let pixels = if body.len() > LINE_BYTES {
-                let (head, tail) = body.split_at(LINE_BYTES);
-                if tail.len() >= AUDIO_BLOCK && tail[..4] == AUDIO_PREFIX {
-                    self.stats.audio_blocks += 1;
-                    emit(Event::Audio(tail[4..AUDIO_BLOCK].to_vec()));
-                } else {
-                    self.stats.unknown_blocks += 1;
-                }
-                head
-            } else {
-                body
-            };
+            // Audio trailers are appended to the line, after the pixels.
+            let line = &self.buffer[cursor + 4..next];
+            let (pixel_end, audio_blocks) = split_audio(line);
+            for bytes in audio_blocks {
+                self.stats.audio_blocks += 1;
+                emit(Event::Audio(bytes.to_vec()));
+            }
+            let pixels = &line[..pixel_end];
 
-            if self.synced && !blanking && self.active_lines < HEIGHT {
-                self.frame.extend_from_slice(pixels);
-                if pixels.len() < LINE_BYTES {
-                    self.frame
-                        .resize(self.frame.len() + LINE_BYTES - pixels.len(), 0);
+            if self.synced && !blanking {
+                match self.line_bytes {
+                    None => self.line_bytes = Some(pixels.len()),
+                    Some(expected) if expected != pixels.len() => {
+                        self.consistent = false;
+                        self.stats.unknown_blocks += 1;
+                    }
+                    Some(_) => {}
                 }
-                self.active_lines += 1;
+                if self.consistent && self.active_lines < MAX_HEIGHT {
+                    self.frame.extend_from_slice(pixels);
+                    self.active_lines += 1;
+                }
             }
 
             self.prev_blanking = blanking;
@@ -169,9 +234,52 @@ impl Assembler {
     }
 }
 
+/// Places `frame` centred on a black canvas of `width` x `height` in YUYV.
+/// A frame larger than the canvas is cropped around its centre.
+pub fn letterbox(frame: &Frame, width: usize, height: usize) -> Vec<u8> {
+    let mut canvas = Vec::with_capacity(width * height * 2);
+    for _ in 0..width * height {
+        canvas.extend_from_slice(&[0x10, 0x80]);
+    }
+    let copy_w = frame.width.min(width);
+    let copy_h = frame.height.min(height);
+    let src_x = ((frame.width - copy_w) / 2) & !1;
+    let src_y = (frame.height - copy_h) / 2;
+    let dst_x = ((width - copy_w) / 2) & !1;
+    let dst_y = (height - copy_h) / 2;
+    for row in 0..copy_h {
+        let src = (src_y + row) * frame.width * 2 + src_x * 2;
+        let dst = (dst_y + row) * width * 2 + dst_x * 2;
+        canvas[dst..dst + copy_w * 2].copy_from_slice(&frame.pixels[src..src + copy_w * 2]);
+    }
+    canvas
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stream(width: usize, height: usize, blanking: usize, frames: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..frames {
+            for _ in 0..blanking {
+                out.extend_from_slice(&[0xff, 0x00, 0x00, 0xab]);
+                out.extend(std::iter::repeat_n(0x10, width * 2));
+            }
+            for n in 0..height {
+                out.extend_from_slice(&[0xff, 0x00, 0x00, 0x80]);
+                out.extend(std::iter::repeat_n(0x42, width * 2));
+                if n % 3 == 0 {
+                    out.extend_from_slice(&[0xff, 0x00, 0xff, 0x02, 1, 0, 2, 0, 3, 0, 4, 0]);
+                } else if n % 7 == 0 {
+                    // Three-pair trailer as seen on 720p60 sources.
+                    out.extend_from_slice(&[0xff, 0x00, 0xff, 0x03]);
+                    out.extend_from_slice(&[5, 0, 6, 0, 7, 0, 8, 0, 9, 0, 10, 0]);
+                }
+            }
+        }
+        out
+    }
 
     #[test]
     fn bt656_guard_bits_accept_observed_status_bytes() {
@@ -192,63 +300,59 @@ mod tests {
     }
 
     #[test]
-    fn assembles_a_frame_from_synthetic_lines() {
-        let mut stream = Vec::new();
-        let line = |out: &mut Vec<u8>, xy: u8, fill: u8| {
-            out.extend_from_slice(&[0xff, 0x00, 0x00, xy]);
-            out.extend(std::iter::repeat_n(fill, LINE_BYTES));
-        };
-        // Three frames, so that two of them end at a blanking edge.
-        for _ in 0..3 {
-            for _ in 0..45 {
-                line(&mut stream, 0xab, 0x10);
-            }
-            for _ in 0..HEIGHT {
-                line(&mut stream, 0x80, 0x42);
-            }
-        }
-
+    fn assembles_1080p_frames_and_audio() {
         let mut assembler = Assembler::new();
         let mut frames = 0;
-        assembler.push(&stream, |event| {
-            if let Event::Frame(frame) = event {
-                assert_eq!(frame.len(), FRAME_BYTES);
-                assert!(frame.iter().all(|&b| b == 0x42));
+        let mut audio = Vec::new();
+        assembler.push(&stream(1920, 1080, 45, 3), |event| match event {
+            Event::Frame(frame) => {
+                assert_eq!((frame.width, frame.height), (1920, 1080));
+                assert_eq!(frame.pixels.len(), 1920 * 1080 * 2);
+                assert!(frame.pixels.iter().all(|&b| b == 0x42));
                 frames += 1;
             }
+            Event::Audio(bytes) => audio.extend_from_slice(&bytes),
         });
-        assert_eq!(frames, 2, "expected two completed frames");
-        assert_eq!(assembler.stats.short_frames, 0);
+        // Three frames, two of them end at a blanking edge.
+        assert_eq!(frames, 2);
+        assert_eq!(&audio[..8], &[1, 0, 2, 0, 3, 0, 4, 0]);
+        // Line 7 carries a three-pair trailer; it follows lines 0, 3 and 6.
+        assert_eq!(&audio[24..36], &[5, 0, 6, 0, 7, 0, 8, 0, 9, 0, 10, 0]);
+        assert_eq!(assembler.stats.bad_frames, 0);
+        assert_eq!(assembler.stats.unknown_blocks, 0);
     }
 
     #[test]
-    fn extracts_embedded_audio_from_overlong_lines() {
-        let mut stream = Vec::new();
-        for _ in 0..2 {
-            for _ in 0..45 {
-                stream.extend_from_slice(&[0xff, 0x00, 0x00, 0xab]);
-                stream.extend(std::iter::repeat_n(0x10, LINE_BYTES));
-            }
-            for n in 0..HEIGHT {
-                stream.extend_from_slice(&[0xff, 0x00, 0x00, 0x80]);
-                stream.extend(std::iter::repeat_n(0x42, LINE_BYTES));
-                if n % 3 == 0 {
-                    stream.extend_from_slice(&AUDIO_PREFIX);
-                    stream.extend_from_slice(&[1, 0, 2, 0, 3, 0, 4, 0]);
-                }
-            }
-        }
-
+    fn follows_the_source_geometry() {
+        // 720p60 as measured: 720 active lines, 30 blanking, 2560 bytes per line.
         let mut assembler = Assembler::new();
-        let mut audio = Vec::new();
-        assembler.push(&stream, |event| {
-            if let Event::Audio(bytes) = event {
-                audio.extend_from_slice(&bytes);
+        let mut seen = Vec::new();
+        let mut data = stream(1280, 720, 30, 2);
+        data.extend(stream(720, 576, 49, 2));
+        assembler.push(&data, |event| {
+            if let Event::Frame(frame) = event {
+                seen.push((frame.width, frame.height));
             }
         });
-        assert!(!audio.is_empty(), "expected audio blocks");
-        assert_eq!(audio.len() % 8, 0);
-        assert_eq!(&audio[..8], &[1, 0, 2, 0, 3, 0, 4, 0]);
-        assert_eq!(assembler.stats.unknown_blocks, 0);
+        assert_eq!(seen, vec![(1280, 720), (1280, 720), (720, 576)]);
+        assert_eq!(assembler.stats.format_changes, 1);
+    }
+
+    #[test]
+    fn letterbox_centres_smaller_frames() {
+        let frame = Frame {
+            width: 4,
+            height: 2,
+            pixels: vec![0x42; 4 * 2 * 2],
+        };
+        let canvas = letterbox(&frame, 8, 4);
+        assert_eq!(canvas.len(), 8 * 4 * 2);
+        // Row 1 (second row) holds the first source row, columns 2..6.
+        let row = &canvas[8 * 2..8 * 2 * 2];
+        assert_eq!(&row[..4], &[0x10, 0x80, 0x10, 0x80]);
+        assert!(row[4..12].iter().all(|&b| b == 0x42));
+        assert_eq!(&row[12..], &[0x10, 0x80, 0x10, 0x80]);
+        // Top row stays black.
+        assert_eq!(&canvas[..4], &[0x10, 0x80, 0x10, 0x80]);
     }
 }

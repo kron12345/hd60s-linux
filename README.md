@@ -17,7 +17,10 @@ Do not use this project for firmware updates.
 
 ## Capturing (Rev. 4)
 
-Frames are written raw to stdout as YUYV 4:2:2, 1920x1080, 60 Hz:
+Frames are written raw to stdout as YUYV 4:2:2. Whatever the source sends
+(1080p60 down to 480p, see `docs/protocol.md`), every frame is placed centred
+on a 1920x1080 canvas so the output keeps one size; `--native` writes frames
+at source size instead and reports the geometry on stderr:
 
 ```bash
 cargo run --release -- capture | \

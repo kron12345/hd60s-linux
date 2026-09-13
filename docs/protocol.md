@@ -246,10 +246,36 @@ its output, which matches it presenting its own EDID to the source. Bytes 13 (`0
 change with the signal; their meaning is open. The bulk stream survived the
 unplug; the feeder service did not need a restart.
 
+### Other input formats
+
+Measured on 2026-09-13 by switching the source (a Radeon RX 7900) through
+its modes. Every one uses the same framing; line length is width × 2, the
+number of active lines is the height, and the timing registers announce both:
+
+| Source | Timing registers | Active + blanking lines | Bytes per line | Frame period |
+|---|---|---|---|---|
+| 1080p60 | 1920×1080, 2200×1125, 60 | 1080 + 45 | 3840 | 4,329,300 |
+| 1080p50 | 1920×1080, 2640×1125, 50 | 1080 + 45 | 3840 | 4,330,260 |
+| 1080p30 | 1920×1080, 2200×1125, 30 | 1080 + 45 | 3840 | 4,333,500 |
+| 720p60 | 1280×720, 1650×750, 60 | 720 + 30 | 2560 | 1,927,784 |
+| 1280×1024@60 | 1280×1024, 1712×1063, 60 | 1024 + 39 | 2560 | 2,730,344 |
+| 576p50 | 720×576, 864×625, 50 | 576 + 49 | 1440 | 907,680 |
+| 480p60 | 720×480, 858×525, 60 | 480 + 45 | 1440 | 762,408 |
+| output off | no signal | — | no transfers at all | — |
+
+All of these are progressive (F = 0 throughout); the source cannot produce an
+interlaced signal, so that case remains unmeasured. With no signal the device
+sends nothing — no black frames, zero bulk transfers.
+
+The assembler now takes width and height from the stream itself and reports a
+format change when they differ from the previous frame. `capture` places
+every frame centred on a 1920×1080 canvas by default, so the output keeps one
+size across source changes; `capture --native` writes frames at source size.
+
 ### Still open
 
-- Behaviour with other input resolutions and frame rates, including interlaced
-  sources (the F bit is parsed but not yet used).
+- Interlaced sources (the F bit is parsed but not yet used); the sources
+  available here are all progressive.
 - Behaviour on signal loss, with an HDCP-protected source, and on a resolution
   change while streaming.
 - Purpose of the isochronous alternate settings 1 and 3 (the official

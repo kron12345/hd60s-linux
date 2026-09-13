@@ -207,7 +207,9 @@ fn observe_stream<T: UsbContext>(device: Device<T>, seconds: u64) -> Result<(), 
 
 /// Reads the bulk stream, assembles frames and writes them raw to stdout.
 ///
-/// The output is YUYV 4:2:2, 1920x1080, 60 Hz, so it can be consumed directly:
+/// The output is YUYV 4:2:2. By default every frame is placed centred on a
+/// 1920x1080 canvas, so the stream keeps one size whatever the source does;
+/// `--native` writes frames at the source size instead and reports changes.
 /// `hd60s-linux capture | ffmpeg -f rawvideo -pix_fmt yuyv422 -s 1920x1080 -r 60 -i - ...`
 /// With `--audio FILE` the embedded audio bytes are written there as well
 /// (16-bit little-endian, stereo, 48 kHz).
@@ -215,6 +217,7 @@ fn capture<T: UsbContext + 'static>(
     device: Device<T>,
     seconds: Option<u64>,
     audio_path: Option<&str>,
+    native: bool,
 ) -> Result<(), String> {
     let handle = device
         .open()
@@ -241,7 +244,10 @@ fn capture<T: UsbContext + 'static>(
     let (frame_sender, frame_receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(3);
     let frame_error = write_error.clone();
     let frame_writer = std::thread::spawn(move || {
-        let mut stdout = std::io::BufWriter::with_capacity(frame::FRAME_BYTES, std::io::stdout());
+        let mut stdout = std::io::BufWriter::with_capacity(
+            frame::MAX_WIDTH * frame::MAX_HEIGHT * 2,
+            std::io::stdout(),
+        );
         for pixels in frame_receiver {
             if let Err(error) = stdout.write_all(&pixels).and_then(|()| stdout.flush()) {
                 *frame_error.lock().unwrap() = Some(format!("writing frame to stdout: {error}"));
@@ -267,11 +273,16 @@ fn capture<T: UsbContext + 'static>(
     let limit = seconds.map(Duration::from_secs);
     let mut reported = Instant::now();
 
-    eprintln!(
-        "capturing {}x{} yuyv422 from bulk endpoint 0x83",
-        frame::WIDTH,
-        frame::HEIGHT
-    );
+    if native {
+        eprintln!("capturing yuyv422 at source size from bulk endpoint 0x83");
+    } else {
+        eprintln!(
+            "capturing yuyv422 on a {}x{} canvas from bulk endpoint 0x83",
+            frame::MAX_WIDTH,
+            frame::MAX_HEIGHT
+        );
+    }
+    let mut geometry: Option<(usize, usize)> = None;
 
     // The reader thread must never pause: the hardware discards data during any
     // gap between two transfers. Decoding therefore happens here, not there.
@@ -305,7 +316,16 @@ fn capture<T: UsbContext + 'static>(
         match receiver.recv_timeout(Duration::from_millis(500)) {
             Ok(chunk) => {
                 assembler.push(&chunk, |event| match event {
-                    Event::Frame(pixels) => {
+                    Event::Frame(frame) => {
+                        if geometry != Some((frame.width, frame.height)) {
+                            eprintln!("source: {}x{}", frame.width, frame.height);
+                            geometry = Some((frame.width, frame.height));
+                        }
+                        let pixels = if native {
+                            frame.pixels
+                        } else {
+                            frame::letterbox(&frame, frame::MAX_WIDTH, frame::MAX_HEIGHT)
+                        };
                         if frame_sender.try_send(pixels).is_err() {
                             dropped_frames += 1;
                         }
@@ -329,12 +349,13 @@ fn capture<T: UsbContext + 'static>(
             let stats = assembler.stats;
             let elapsed = started.elapsed().as_secs_f64();
             eprintln!(
-                "{} frame(s), {:.1} fps, {} audio block(s), {} short, {} unknown, {}/{} dropped by consumer",
+                "{} frame(s), {:.1} fps, {} audio block(s), {} bad, {} unknown, {} format change(s), {}/{} dropped by consumer",
                 stats.frames,
                 stats.frames as f64 / elapsed,
                 stats.audio_blocks,
-                stats.short_frames,
+                stats.bad_frames,
                 stats.unknown_blocks,
+                stats.format_changes,
                 dropped_frames,
                 dropped_audio
             );
@@ -364,12 +385,12 @@ fn capture<T: UsbContext + 'static>(
     let stats = assembler.stats;
     let elapsed = started.elapsed().as_secs_f64();
     eprintln!(
-        "capture ended: {} frame(s) in {:.1} s ({:.2} fps), {} audio block(s), {} short frame(s)",
+        "capture ended: {} frame(s) in {:.1} s ({:.2} fps), {} audio block(s), {} bad frame(s)",
         stats.frames,
         elapsed,
         stats.frames as f64 / elapsed,
         stats.audio_blocks,
-        stats.short_frames
+        stats.bad_frames
     );
     Ok(())
 }
@@ -466,7 +487,7 @@ enum Operation {
     Inspect,
     ObserveInterrupt(u64),
     ObserveStream(u64),
-    Capture(Option<u64>, Option<String>),
+    Capture(Option<u64>, Option<String>, bool),
     Signal(Option<u64>),
     Status,
 }
@@ -488,8 +509,8 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
                         .map_err(|error| format!("observing HD60 S interrupt endpoint: {error}"));
                 }
                 Operation::ObserveStream(seconds) => return observe_stream(device, seconds),
-                Operation::Capture(seconds, ref audio) => {
-                    return capture(device, seconds, audio.as_deref());
+                Operation::Capture(seconds, ref audio, native) => {
+                    return capture(device, seconds, audio.as_deref(), native);
                 }
                 Operation::Signal(seconds) => return read_signal(device, seconds),
                 Operation::Status => return read_direct_startup_status(device),
@@ -527,14 +548,15 @@ fn main() -> ExitCode {
                 .position(|argument| argument == "--audio")
                 .and_then(|at| arguments.get(at + 1))
                 .cloned();
+            let native = arguments.iter().any(|argument| argument == "--native");
             let limit = arguments
                 .get(1)
                 .filter(|argument| !argument.starts_with("--"))
                 .map(|argument| argument.parse::<u64>());
             match limit {
-                Some(Ok(value)) => Ok(Operation::Capture(Some(value), audio)),
+                Some(Ok(value)) => Ok(Operation::Capture(Some(value), audio, native)),
                 Some(Err(error)) => Err(error),
-                None => Ok(Operation::Capture(None, audio)),
+                None => Ok(Operation::Capture(None, audio, native)),
             }
         }
         Some("signal") => match arguments.get(1) {
@@ -551,7 +573,7 @@ fn main() -> ExitCode {
         Err(_) => {
             eprintln!(
                 "error: usage: hd60s-linux [status|signal|observe|observe-stream|capture] \
-                 [SECONDS] [--audio FILE]"
+                 [SECONDS] [--audio FILE] [--native]"
             );
             return ExitCode::FAILURE;
         }
