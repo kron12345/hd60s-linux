@@ -55,7 +55,9 @@ export component MainWindow inherits Window {
     // scaling factor.
     in-out property <length> preview-width: preview-area.width;
     in-out property <string> service-text: "";
-    in-out property <bool> autostart: false;
+    in-out property <int> autostart-index: 0;
+    in-out property <string> autostart-hint: "";
+    in-out property <bool> close-to-tray: true;
     in-out property <bool> service-running: false;
 
     callback set-control(string, int);
@@ -66,7 +68,8 @@ export component MainWindow inherits Window {
     callback toggle-stream();
     callback restore-edid();
     callback generate-report();
-    callback toggle-autostart(bool);
+    callback set-autostart(int);
+    callback set-close-to-tray(bool);
     callback toggle-service();
 
     HorizontalBox {
@@ -148,10 +151,20 @@ export component MainWindow inherits Window {
                 VerticalBox {
                     padding: 0;
                     Text { text: root.service-text; wrap: word-wrap; }
+                    HorizontalBox {
+                        padding: 0;
+                        Text { text: "Autostart"; width: 90px; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["none — only while this program runs", "with the desktop, minimised to the tray", "systemd user service in the background"];
+                            current-index <=> root.autostart-index;
+                            selected => { root.set-autostart(self.current-index); }
+                        }
+                    }
+                    Text { text: root.autostart-hint; color: #888; wrap: word-wrap; }
                     CheckBox {
-                        text: "Start automatically in the background (systemd)";
-                        checked: root.autostart;
-                        toggled => { root.toggle-autostart(self.checked); }
+                        text: "Closing the window keeps the program in the tray";
+                        checked: root.close-to-tray;
+                        toggled => { root.set-close-to-tray(self.checked); }
                     }
                     Button {
                         text: root.service-running ? "Stop service" : "Start service";

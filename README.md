@@ -21,7 +21,7 @@ Arch Linux (and derivatives), from the `packaging/` directory:
 
 ```bash
 cd packaging && makepkg -si
-systemctl --user enable --now hd60s-serve.service
+hd60s-control   # or: HD60 S Control in the application menu
 ```
 
 Debian/Ubuntu, with [cargo-deb](https://github.com/kornelski/cargo-deb):
@@ -29,7 +29,7 @@ Debian/Ubuntu, with [cargo-deb](https://github.com/kornelski/cargo-deb):
 ```bash
 cargo install cargo-deb && cargo deb
 sudo apt install ./target/debian/hd60s-linux_*.deb
-systemctl --user enable --now hd60s-serve.service
+hd60s-control   # or: HD60 S Control in the application menu
 ```
 
 Both install the binary, a udev rule that lets the logged-in user open the
@@ -80,13 +80,23 @@ Wayland (Plasma, sway) and X11. It talks to the service over
 reach — no port, no token, nothing a browser can get at. The web panel
 below offers the same over HTTP for remote or scripted use.
 
-The program also decides how the service runs. Its *Service* box has
-**Start automatically in the background (systemd)**: ticked, the user unit
-is enabled — it starts when the card is plugged in and at login, and the
-tray icon is always there. Unticked, the unit is disabled and masked, and
-the program runs its own `hd60s-linux serve` for exactly as long as it is
-open; close it and the card is released. *Start/Stop service* does the
-same by hand.
+The program also decides how the service runs. Nothing starts by itself
+after the installation: open *HD60 S Control* and it runs the service
+while it is open (closing the window keeps it in the tray by default;
+*Quit* in the tray releases the card). Its *Service* box offers the
+autostart choices:
+
+- **none** — only while the program runs;
+- **with the desktop, minimised to the tray** — an XDG autostart entry
+  (`~/.config/autostart/hd60s-control.desktop`, `hd60s-control --tray`),
+  which Plasma and GNOME honour; sway users add
+  `exec hd60s-control --tray` to their config instead;
+- **systemd user service in the background** — `hd60s-serve.service` is
+  enabled and runs at login and with the card even without the program;
+  the choice for headless boxes (OBS, Frigate) and for the web panel.
+
+Uninstalling the package leaves nothing running; the autostart entry or
+the enabled unit are plain files in your home directory.
 
 ### Control panel
 

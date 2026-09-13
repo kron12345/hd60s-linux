@@ -14,8 +14,96 @@ use slint::{Image, Rgb8Pixel, SharedPixelBuffer};
 
 slint::include_modules!();
 
+mod tray;
+
 const WIDTH: usize = 1920;
 const HEIGHT: usize = 1080;
+
+/// What the tray and the window share.
+pub struct Runtime {
+    pub quitting: AtomicBool,
+    pub close_to_tray: AtomicBool,
+}
+
+fn config_path() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("hd60s-linux/control.conf")
+}
+
+/// `key=value` lines; only `close_to_tray` so far.
+fn read_config() -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(config_path())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect()
+}
+
+fn write_config(key: &str, value: &str) {
+    let mut config = read_config();
+    config.insert(key.to_string(), value.to_string());
+    let path = config_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let text = config
+        .iter()
+        .map(|(k, v)| format!("{k}={v}\n"))
+        .collect::<String>();
+    let _ = std::fs::write(path, text);
+}
+
+fn autostart_file() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("autostart/hd60s-control.desktop")
+}
+
+/// 0 none, 1 with the desktop (XDG autostart), 2 systemd user service.
+fn autostart_mode() -> usize {
+    if autostart_file().exists() {
+        1
+    } else if systemctl(&["is-enabled"]).as_deref() == Ok("enabled") {
+        2
+    } else {
+        0
+    }
+}
+
+fn set_autostart(mode: usize) -> Result<String, String> {
+    let file = autostart_file();
+    match mode {
+        1 => {
+            let _ = systemctl(&["disable", "--now"]);
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(
+                &file,
+                "[Desktop Entry]\nType=Application\nName=HD60 S Control\nExec=hd60s-control --tray\nIcon=hd60s-control\nX-GNOME-Autostart-enabled=true\n",
+            )
+            .map_err(|e| e.to_string())?;
+            Ok("starts with the desktop, minimised to the tray (sway: add `exec hd60s-control --tray` to your config)".into())
+        }
+        2 => {
+            let _ = std::fs::remove_file(&file);
+            systemctl(&["unmask"])?;
+            systemctl(&["enable", "--now"])?;
+            Ok("systemd user service enabled: runs at login and with the card, even without this program".into())
+        }
+        _ => {
+            let _ = std::fs::remove_file(&file);
+            let _ = systemctl(&["disable", "--now"]);
+            Ok("no autostart: the service runs while this program is open".into())
+        }
+    }
+}
 
 fn socket_path() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
@@ -303,32 +391,67 @@ fn apply_state(ui: &MainWindow, s: &Value) {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    let start_in_tray = std::env::args().any(|a| a == "--tray");
+    // The Wayland app id (and X11 class) must match the desktop entry for
+    // the panel to show our icon and group the window.
+    slint::BackendSelector::new()
+        .with_winit_window_attributes_hook(|attributes| {
+            use slint::winit_030::winit::platform::wayland::WindowAttributesExtWayland as W;
+            use slint::winit_030::winit::platform::x11::WindowAttributesExtX11 as X;
+            let attributes = W::with_name(attributes, "hd60s-control", "hd60s-control");
+            X::with_name(attributes, "hd60s-control", "hd60s-control")
+        })
+        .select()?;
     let ui = MainWindow::new()?;
+    let config = read_config();
+    let runtime = Arc::new(Runtime {
+        quitting: AtomicBool::new(false),
+        close_to_tray: AtomicBool::new(
+            config
+                .get("close_to_tray")
+                .map(|v| v != "false")
+                .unwrap_or(true),
+        ),
+    });
+    ui.set_close_to_tray(runtime.close_to_tray.load(Ordering::Relaxed));
+    {
+        let runtime = runtime.clone();
+        ui.on_set_close_to_tray(move |on| {
+            runtime.close_to_tray.store(on, Ordering::Relaxed);
+            write_config("close_to_tray", if on { "true" } else { "false" });
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        ui.window().on_close_requested(move || {
+            if runtime.close_to_tray.load(Ordering::Relaxed)
+                && !runtime.quitting.load(Ordering::Relaxed)
+            {
+                slint::CloseRequestResponse::HideWindow
+            } else {
+                let _ = slint::quit_event_loop();
+                slint::CloseRequestResponse::HideWindow
+            }
+        });
+    }
+    let tray_handle = tray::start(ui.as_weak(), runtime.clone());
     let busy = Arc::new(AtomicBool::new(false));
     // Downscaling factor for the preview, chosen from the widget's width.
     let factor = Arc::new(std::sync::atomic::AtomicUsize::new(2));
     let own: Arc<std::sync::Mutex<Option<OwnService>>> = Arc::new(std::sync::Mutex::new(None));
 
-    // Service control: the systemd unit or, without it, our own child.
+    // Service control: autostart mode, and the systemd unit or our own child.
     {
         let own = own.clone();
         let weak = ui.as_weak();
-        ui.on_toggle_autostart(move |on| {
+        ui.on_set_autostart(move |index| {
             let own = own.clone();
             let weak = weak.clone();
             std::thread::spawn(move || {
-                let result = if on {
+                if index == 2 {
                     own.lock().unwrap().take();
-                    systemctl(&["unmask"]).and_then(|_| systemctl(&["enable", "--now"]))
-                } else {
-                    systemctl(&["disable", "--now"]).and_then(|_| systemctl(&["mask"]))
-                };
-                let message = match result {
-                    Ok(_) if on => "service enabled: starts with the card and at login".to_string(),
-                    Ok(_) => "service disabled and masked: runs only while this program is open"
-                        .to_string(),
-                    Err(error) => error,
-                };
+                }
+                let message = set_autostart(index as usize).unwrap_or_else(|e| e);
                 let _ = weak.upgrade_in_event_loop(move |ui| ui.set_message(message.into()));
             });
         });
@@ -446,6 +569,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = ui.as_weak();
         let own = own.clone();
+        let tray_handle = tray_handle.clone();
         std::thread::spawn(move || {
             let mut tick = 0_u32;
             let mut tried_own = false;
@@ -463,8 +587,13 @@ fn main() -> Result<(), slint::PlatformError> {
                         continue;
                     }
                 }
+                if let Some(handle) = &tray_handle {
+                    let snapshot = result.as_ref().ok().cloned();
+                    handle.update(|tray| tray.apply(snapshot.as_ref()));
+                }
                 if tick.is_multiple_of(5) {
                     let enabled = systemctl(&["is-enabled"]).unwrap_or_default();
+                    let mode = autostart_mode();
                     let active = systemctl(&["is-active"]).unwrap_or_default() == "active";
                     let own_running = own.lock().unwrap().is_some();
                     let text = match (active, own_running, result.is_ok()) {
@@ -476,11 +605,18 @@ fn main() -> Result<(), slint::PlatformError> {
                         (false, false, true) => "running elsewhere".to_string(),
                         (false, false, false) => format!("not running (unit {enabled})"),
                     };
-                    let autostart = enabled == "enabled";
                     let running = result.is_ok();
                     let _ = weak.upgrade_in_event_loop(move |ui| {
                         ui.set_service_text(text.into());
-                        ui.set_autostart(autostart);
+                        ui.set_autostart_index(mode as i32);
+                        ui.set_autostart_hint(
+                            match mode {
+                                1 => "sway users: add `exec hd60s-control --tray` to the sway config instead.",
+                                2 => "The unit keeps running when this program is closed.",
+                                _ => "",
+                            }
+                            .into(),
+                        );
                         ui.set_service_running(running);
                     });
                 }
@@ -547,7 +683,10 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    let result = ui.run();
+    if !start_in_tray {
+        ui.show()?;
+    }
+    let result = slint::run_event_loop_until_quit();
     // Our own service, if any, ends with the program.
     own.lock().unwrap().take();
     result

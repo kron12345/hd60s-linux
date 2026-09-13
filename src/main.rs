@@ -1099,7 +1099,9 @@ fn main() -> ExitCode {
             Some("on") => Some("127.0.0.1:8060".to_string()),
             Some(address) => Some(address.to_string()),
         };
-        let tray = !matches!(option("--tray").as_deref(), Some("off") | Some("none"));
+        // The control program carries the tray icon; the service shows its
+        // own only when asked (headless setups with a panel).
+        let tray = matches!(option("--tray").as_deref(), Some("on"));
         let record_dir = option("--record-dir")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -1166,7 +1168,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "error: usage: hd60s-linux [status|signal|picture|audio|edid|mcu|report|serve|observe|observe-stream|observe-iso|capture] \\
                  [SECONDS] [--audio FILE] [--native]\n       picture [--range bypass|shrink|expand] \\
-                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]\n       serve [--name NAME] [--panel on|ADDR] [--tray off] [--record-dir DIR] [--record-encoder auto|x264|vaapi] [--stream on|off] [--stream-bind ADDR|off] [--stream-fps N] [--stream-scale N] [--stream-token T] [--from-file RAW [--fps N]]\n       report [--show-serial] [--no-capture]"
+                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]\n       serve [--name NAME] [--panel on|ADDR] [--tray on] [--record-dir DIR] [--record-encoder auto|x264|vaapi] [--stream on|off] [--stream-bind ADDR|off] [--stream-fps N] [--stream-scale N] [--stream-token T] [--from-file RAW [--fps N]]\n       report [--show-serial] [--no-capture]"
             );
             return ExitCode::FAILURE;
         }

@@ -95,7 +95,11 @@ impl Tray {
     /// The native control program when it is installed, the web panel
     /// otherwise.
     fn open_panel(&self) {
-        if std::process::Command::new("hd60s-control").spawn().is_ok() {
+        if let Ok(mut child) = std::process::Command::new("hd60s-control").spawn() {
+            // Reap it when it ends so it does not linger as a zombie.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
             return;
         }
         if let Some(url) = &self.panel_url {
