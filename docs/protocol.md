@@ -225,6 +225,17 @@ private (they contain the serial and captured video).
     `86 80 80 80`, "Reset Defaults" `80 80 80 80`. The `80 81 80 80` written
     1.5 s after every stream start and reverted 3 s later is a brief +1
     contrast nudge, presumably to make the receiver re-apply the controls.
+  - `0x3b`: audio gain. `00` mutes, `80` is 0 dB and each step is about
+    0.5 dB (measured with a test tone through the capture: -32 dB at `40`,
+    -16 dB at `60`, clipping above `a0`). This is the register behind the
+    application's "Analog Audio Gain" slider (-12..+12 dB ≈ `68`..`98`),
+    which the driver also sets to `80` at PnP and before every stream start.
+    It affects the captured audio only; the bulk and isochronous video paths
+    do not react to it.
+  - `0x3a` and `0x3c` (set to `00` and `80` at PnP): no observed effect on
+    video, timing, audio, or the isochronous path for any value tried.
+    `0x0d` (`12`) and `0x0e` (`30`) sit in the timing block and read back
+    unchanged after a write — status, not configuration.
   - The application never rewrites the EDID for any setting; it does not
     force an input resolution on the source.
   - `hd60s-linux picture` reads and writes these two registers from Linux
@@ -244,7 +255,13 @@ private (they contain the serial and captured video).
   while no HDMI signal is present, and it stayed off with the driver loaded
   and while the application streamed. Replaying the driver's writes from Linux
   (`0x13` := `80 81 80 80`, and `0x3b` := `80` followed by `0x10` := `01`)
-  changed nothing visible.
+  changed nothing visible, and neither did streaming over the official
+  isochronous path with `observe-iso`. On this unit the strip never lights
+  in normal operation; whatever turns it white is not on the USB side.
+- Bank `0x64` read as a whole (registers `0x00`–`0x7f`): besides the timing
+  block and the registers above, `0x3b` and `0x3c` hold `80`, `0x3a` holds
+  `00`, and `0x7a`–`0x7e` echo the last MCU proxy command (`ab 03 12 34 58`
+  from the PnP sequence) — the bank exposes the mailbox to the MCU.
 
 ### Bank `0x64` registers `0x00`–`0x1f`: the input timing
 

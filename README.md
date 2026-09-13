@@ -56,6 +56,15 @@ cargo run --release -- picture --range expanded --brightness 150
 cargo run --release -- picture --reset
 ```
 
+Audio gain (bank `0x64` register `0x3b`; 128 is 0 dB, about 0.5 dB per
+step, 0 mutes):
+
+```bash
+cargo run --release -- audio
+cargo run --release -- audio --gain 104   # about -12 dB
+cargo run --release -- audio --mute
+```
+
 ## USB characterization
 
 The `hd60s-linux` binary locates the device and prints its configurations,

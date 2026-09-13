@@ -37,6 +37,9 @@ const COLOUR_RANGE_REGISTER: u16 = 0x0012;
 /// Bank 0x64 register holding brightness, contrast, saturation and hue,
 /// one byte each with 0x80 as neutral.
 const PICTURE_REGISTER: u16 = 0x0013;
+/// Bank 0x64 register for the audio gain: 0x00 mutes, 0x80 is 0 dB, and
+/// each step is about 0.5 dB (measured -32 dB at 0x40, -16 dB at 0x60).
+const AUDIO_GAIN_REGISTER: u16 = 0x003b;
 
 fn transfer_name(transfer_type: TransferType) -> &'static str {
     match transfer_type {
@@ -580,6 +583,48 @@ struct PictureSettings {
     reset: bool,
 }
 
+/// Shows or sets the audio gain register (bank 0x64, register 0x3b), the
+/// register behind the application's "Analog Audio Gain" slider.
+fn audio<T: UsbContext>(device: Device<T>, gain: Option<u8>) -> Result<(), String> {
+    let handle = device
+        .open()
+        .map_err(|error| format!("opening device: {error}"))?;
+    let timeout = Duration::from_secs(1);
+    if let Some(gain) = gain {
+        handle
+            .write_control(
+                rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Device),
+                REGISTER_REQUEST,
+                SIGNAL_REGISTER_BANK,
+                AUDIO_GAIN_REGISTER,
+                &[gain],
+                timeout,
+            )
+            .map_err(|error| format!("writing audio gain: {error}"))?;
+    }
+    let mut value = [0_u8; 1];
+    handle
+        .read_control(
+            rusb::request_type(Direction::In, RequestType::Vendor, Recipient::Device),
+            REGISTER_REQUEST,
+            SIGNAL_REGISTER_BANK,
+            AUDIO_GAIN_REGISTER,
+            &mut value,
+            timeout,
+        )
+        .map_err(|error| format!("reading audio gain: {error}"))?;
+    let gain = value[0];
+    if gain == 0 {
+        println!("audio gain: 0 (muted)");
+    } else {
+        println!(
+            "audio gain: {gain} ({:+.1} dB relative to 0x80)",
+            (gain as f64 - 128.0) * 0.5
+        );
+    }
+    Ok(())
+}
+
 /// Shows or changes the HDMI colour range and the picture controls, using
 /// exactly the register writes the official application makes:
 /// bank 0x64 register 0x12 for the range, register 0x13 (four bytes) for
@@ -767,6 +812,7 @@ enum Operation {
     Capture(Option<u64>, Option<String>, bool),
     Signal(Option<u64>),
     Picture(PictureSettings),
+    Audio(Option<u8>),
     Status,
 }
 
@@ -793,6 +839,7 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
                 }
                 Operation::Signal(seconds) => return read_signal(device, seconds),
                 Operation::Picture(ref settings) => return picture(device, settings.clone()),
+                Operation::Audio(gain) => return audio(device, gain),
                 Operation::Status => return read_direct_startup_status(device),
                 Operation::Inspect => {}
             }
@@ -874,6 +921,16 @@ fn main() -> ExitCode {
             None => Ok(Operation::Signal(None)),
         },
         Some("picture") => parse_picture(&arguments[1..]).map(Operation::Picture),
+        Some("audio") => match arguments.get(1).map(String::as_str) {
+            Some("--mute") => Ok(Operation::Audio(Some(0))),
+            Some("--gain") => arguments
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or("")
+                .parse::<u8>()
+                .map(|gain| Operation::Audio(Some(gain))),
+            _ => Ok(Operation::Audio(None)),
+        },
         Some("status") => Ok(Operation::Status),
         _ => Ok(Operation::Inspect),
     };
@@ -881,9 +938,9 @@ fn main() -> ExitCode {
         Ok(operation) => operation,
         Err(_) => {
             eprintln!(
-                "error: usage: hd60s-linux [status|signal|picture|observe|observe-stream|observe-iso|capture] \\
+                "error: usage: hd60s-linux [status|signal|picture|audio|observe|observe-stream|observe-iso|capture] \\
                  [SECONDS] [--audio FILE] [--native]\n       picture [--range standard|expanded] \\
-                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]"
+                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]"
             );
             return ExitCode::FAILURE;
         }
