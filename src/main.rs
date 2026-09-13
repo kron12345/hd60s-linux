@@ -5,7 +5,7 @@ use std::{fs::File, io::Write};
 use hd60s_linux::control::Control;
 use hd60s_linux::device::{known_ids, revision as hd60s_revision};
 use hd60s_linux::edid;
-use hd60s_linux::frame::{self, Assembler, Event};
+use hd60s_linux::frame;
 use hd60s_linux::serve::{Source, serve};
 use rusb::{
     Context, Device, DeviceDescriptor, Direction, Recipient, RequestType, TransferType, UsbContext,
@@ -220,16 +220,6 @@ fn capture<T: UsbContext + 'static>(
     let handle = device
         .open()
         .map_err(|error| format!("opening device: {error}"))?;
-    // A kernel driver bound to the interface (for example hd60s.ko) is
-    // detached first; libusb rebinds nothing, so it stays off until a replug.
-    let _ = handle.set_auto_detach_kernel_driver(true);
-    handle
-        .claim_interface(0)
-        .map_err(|error| format!("claiming interface 0: {error}"))?;
-    handle
-        .set_alternate_setting(0, 4)
-        .map_err(|error| format!("selecting interface 0 alternate setting 4: {error}"))?;
-
     let audio_file = match audio_path {
         Some(path) => {
             Some(File::create(path).map_err(|error| format!("creating {path}: {error}"))?)
@@ -267,12 +257,6 @@ fn capture<T: UsbContext + 'static>(
             }
         }
     });
-    let mut dropped_frames = 0_u64;
-    let mut dropped_audio = 0_u64;
-    let mut assembler = Assembler::new();
-    let started = Instant::now();
-    let limit = seconds.map(Duration::from_secs);
-    let mut reported = Instant::now();
 
     if native {
         eprintln!("capturing yuyv422 at source size from bulk endpoint 0x83");
@@ -283,108 +267,76 @@ fn capture<T: UsbContext + 'static>(
             frame::MAX_HEIGHT
         );
     }
-    let mut geometry: Option<(usize, usize)> = None;
 
-    // The reader thread must never pause: the hardware discards data during any
-    // gap between two transfers. Decoding therefore happens here, not there.
+    // The pump reads with queued asynchronous transfers (the hardware
+    // discards data during any gap) and decodes on this thread.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
-    let reader_stop = stop.clone();
-    let reader = std::thread::spawn(move || -> Result<(), String> {
-        let timeout = Duration::from_millis(200);
-        let mut buffer = vec![0_u8; 1024 * 1024];
-        while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
-            match handle.read_bulk(0x83, &mut buffer, timeout) {
-                Ok(length) => {
-                    if sender.send(buffer[..length].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(rusb::Error::Timeout) => {}
-                Err(error) => return Err(format!("reading bulk endpoint 0x83: {error}")),
+    let live = std::sync::Arc::new(std::sync::Mutex::new(frame::Stats::default()));
+    let started = Instant::now();
+    let mut reported = Instant::now();
+    let mut geometry: Option<(usize, usize)> = None;
+    let dropped_frames = std::cell::Cell::new(0_u64);
+    let dropped_audio = std::cell::Cell::new(0_u64);
+    let result = hd60s_linux::pump::run_with_stats(
+        hd60s_linux::pump::Input::Usb(std::sync::Arc::new(handle)),
+        stop.clone(),
+        seconds,
+        Some(live.clone()),
+        |frame| {
+            if geometry != Some((frame.width, frame.height)) {
+                eprintln!("source: {}x{}", frame.width, frame.height);
+                geometry = Some((frame.width, frame.height));
             }
-        }
-        Ok(())
-    });
-
-    let mut dropped = 0_u64;
-    loop {
-        if let Some(limit) = limit
-            && started.elapsed() >= limit
-        {
-            break;
-        }
-        match receiver.recv_timeout(Duration::from_millis(500)) {
-            Ok(chunk) => {
-                assembler.push(&chunk, |event| match event {
-                    Event::Frame(frame) => {
-                        if geometry != Some((frame.width, frame.height)) {
-                            eprintln!("source: {}x{}", frame.width, frame.height);
-                            geometry = Some((frame.width, frame.height));
-                        }
-                        let pixels = if native {
-                            frame.pixels
-                        } else {
-                            frame::letterbox(frame, frame::MAX_WIDTH, frame::MAX_HEIGHT)
-                        };
-                        if frame_sender.try_send(pixels).is_err() {
-                            dropped_frames += 1;
-                        }
-                    }
-                    Event::Audio(bytes) => {
-                        if audio_path.is_some() && audio_sender.try_send(bytes).is_err() {
-                            dropped_audio += 1;
-                        }
-                    }
-                });
+            let pixels = if native {
+                frame.pixels
+            } else {
+                frame::letterbox(frame, frame::MAX_WIDTH, frame::MAX_HEIGHT)
+            };
+            if frame_sender.try_send(pixels).is_err() {
+                dropped_frames.set(dropped_frames.get() + 1);
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => dropped += 1,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-        if let Some(error) = write_error.lock().unwrap().take() {
-            // Consumer gone (for example FFmpeg exited): that is a normal end.
-            eprintln!("stopping: {error}");
-            break;
-        }
-        if reported.elapsed() >= Duration::from_secs(5) {
-            let stats = assembler.stats;
-            let elapsed = started.elapsed().as_secs_f64();
-            eprintln!(
-                "{} frame(s), {:.1} fps, {} audio block(s), {} bad, {} unknown, {} format change(s), {}/{} dropped by consumer",
-                stats.frames,
-                stats.frames as f64 / elapsed,
-                stats.audio_blocks,
-                stats.bad_frames,
-                stats.unknown_blocks,
-                stats.format_changes,
-                dropped_frames,
-                dropped_audio
-            );
-            reported = Instant::now();
-        }
-    }
-
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    drop(receiver);
-    if let Ok(Err(error)) = reader.join() {
-        eprintln!("reader thread: {error}");
-    }
+            if let Some(error) = write_error.lock().unwrap().take() {
+                // Consumer gone (for example FFmpeg exited): a normal end.
+                eprintln!("stopping: {error}");
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if reported.elapsed() >= Duration::from_secs(5) {
+                let stats = *live.lock().unwrap();
+                let elapsed = started.elapsed().as_secs_f64();
+                eprintln!(
+                    "{} frame(s), {:.1} fps, {} audio block(s), {} bad, {} unknown, {} format change(s), {}/{} dropped by consumer",
+                    stats.frames,
+                    stats.frames as f64 / elapsed,
+                    stats.audio_blocks,
+                    stats.bad_frames,
+                    stats.unknown_blocks,
+                    stats.format_changes,
+                    dropped_frames.get(),
+                    dropped_audio.get()
+                );
+                reported = Instant::now();
+            }
+        },
+        |bytes| {
+            if audio_path.is_some() && audio_sender.try_send(bytes).is_err() {
+                dropped_audio.set(dropped_audio.get() + 1);
+            }
+        },
+    );
+    let elapsed = started.elapsed().as_secs_f64();
     drop(frame_sender);
     drop(audio_sender);
     // The frame writer may sit in a write to a stalled consumer; every frame
     // is flushed as it is written, so there is nothing to wait for.
     drop(frame_writer);
     let _ = audio_writer.join();
+    let (dropped_frames, dropped_audio) = (dropped_frames.get(), dropped_audio.get());
     if dropped_frames > 0 || dropped_audio > 0 {
         eprintln!(
             "{dropped_frames} frame(s) and {dropped_audio} audio block(s) dropped by a slow consumer"
         );
     }
-    if dropped > 0 {
-        eprintln!("{dropped} read timeout(s)");
-    }
-    let stats = assembler.stats;
-    let elapsed = started.elapsed().as_secs_f64();
+    let stats = result?;
     eprintln!(
         "capture ended: {} frame(s) in {:.1} s ({:.2} fps), {} audio block(s), {} bad frame(s)",
         stats.frames,
