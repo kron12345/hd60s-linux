@@ -15,6 +15,28 @@ stream data under the same sequence, so the other revisions are not yet
 confirmed to work. The protocol is documented from measurements, not guessed.
 Do not use this project for firmware updates.
 
+## Install
+
+Arch Linux (and derivatives), from the `packaging/` directory:
+
+```bash
+cd packaging && makepkg -si
+systemctl --user enable --now hd60s-serve.service
+```
+
+Debian/Ubuntu, with [cargo-deb](https://github.com/kornelski/cargo-deb):
+
+```bash
+cargo install cargo-deb && cargo deb
+sudo apt install ./target/debian/hd60s-linux_*.deb
+systemctl --user enable --now hd60s-serve.service
+```
+
+Both install the binary, a udev rule that lets the logged-in user open the
+device (that is the only step that needs root, and the package does it) and
+starts the service when a card is plugged in, and the user unit. Nothing
+runs as root and no kernel module is involved.
+
 ## Use it as a camera (PipeWire, no kernel module)
 
 ```bash

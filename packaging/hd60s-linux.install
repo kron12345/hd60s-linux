@@ -1,0 +1,10 @@
+post_install() {
+  udevadm control --reload-rules 2>/dev/null || true
+  udevadm trigger --subsystem-match=usb 2>/dev/null || true
+  cat <<'MSG'
+==> hd60s-linux: enable the camera for your user with
+      systemctl --user enable --now hd60s-serve.service
+    It also starts by itself when a card is plugged in.
+MSG
+}
+post_upgrade() { post_install; }

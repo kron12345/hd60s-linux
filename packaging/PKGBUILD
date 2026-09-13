@@ -1,0 +1,42 @@
+# Maintainer: Sebastian Ortwein <kron@animeland.de>
+pkgname=hd60s-linux-git
+pkgver=r0
+pkgrel=1
+pkgdesc="Elgato Game Capture HD60 S as a PipeWire camera and microphone (userspace, no kernel module)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/kron12345/hd60s-linux"
+license=('MIT')
+depends=('libpipewire' 'libusb' 'pipewire')
+makedepends=('git' 'cargo' 'clang' 'pkgconf')
+provides=('hd60s-linux')
+conflicts=('hd60s-linux')
+source=("git+https://github.com/kron12345/hd60s-linux.git#branch=pipewire")
+install=hd60s-linux.install
+sha256sums=('SKIP')
+
+pkgver() {
+  cd hd60s-linux
+  printf 'r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd hd60s-linux
+  export CARGO_HOME="$srcdir/cargo-home"
+  cargo build --release --locked
+}
+
+check() {
+  cd hd60s-linux
+  export CARGO_HOME="$srcdir/cargo-home"
+  cargo test --release --locked
+}
+
+package() {
+  cd hd60s-linux
+  install -Dm755 target/release/hd60s-linux "$pkgdir/usr/bin/hd60s-linux"
+  install -Dm644 packaging/70-hd60s-linux.rules "$pkgdir/usr/lib/udev/rules.d/70-hd60s-linux.rules"
+  install -Dm644 packaging/hd60s-serve.service "$pkgdir/usr/lib/systemd/user/hd60s-serve.service"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 docs/protocol.md "$pkgdir/usr/share/doc/$pkgname/protocol.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

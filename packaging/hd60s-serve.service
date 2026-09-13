@@ -1,0 +1,15 @@
+[Unit]
+Description=Elgato HD60 S as PipeWire camera and microphone
+Documentation=https://github.com/kron12345/hd60s-linux
+After=pipewire.service wireplumber.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+ExecStart=/usr/bin/hd60s-linux serve
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=5
+
+[Install]
+WantedBy=default.target

@@ -15,3 +15,17 @@ memchr = "2.7"
 pipewire = { version = "0.10", features = ["v1_2_0"] }
 pipewire-vircam = "0.7"
 rusb = "0.9.4"
+
+[package.metadata.deb]
+maintainer = "Sebastian Ortwein <kron@animeland.de>"
+extended-description = "Elgato Game Capture HD60 S as a PipeWire camera and microphone: a userspace driver, no kernel module."
+depends = "libpipewire-0.3-0, libusb-1.0-0, pipewire"
+section = "video"
+priority = "optional"
+assets = [
+    ["target/release/hd60s-linux", "usr/bin/", "755"],
+    ["packaging/70-hd60s-linux.rules", "usr/lib/udev/rules.d/", "644"],
+    ["packaging/hd60s-serve.service", "usr/lib/systemd/user/", "644"],
+    ["README.md", "usr/share/doc/hd60s-linux/", "644"],
+    ["docs/protocol.md", "usr/share/doc/hd60s-linux/", "644"],
+]

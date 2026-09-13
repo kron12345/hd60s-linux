@@ -1,0 +1,8 @@
+# Elgato Game Capture HD60 S, all four hardware revisions.
+# uaccess: the user at the local seat may open the device without root.
+# The last line starts the user's hd60s-serve.service when a card is plugged in.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="004f", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="005e", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="0074", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="0076", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="004f|005e|0074|0076", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}="hd60s-serve.service"
