@@ -235,11 +235,17 @@ impl Assembler {
 }
 
 /// Places `frame` centred on a black canvas of `width` x `height` in YUYV.
-/// A frame larger than the canvas is cropped around its centre.
-pub fn letterbox(frame: &Frame, width: usize, height: usize) -> Vec<u8> {
-    let mut canvas = Vec::with_capacity(width * height * 2);
-    for _ in 0..width * height {
-        canvas.extend_from_slice(&[0x10, 0x80]);
+/// A frame larger than the canvas is cropped around its centre; a frame of
+/// exactly the canvas size is returned as it is.
+pub fn letterbox(frame: Frame, width: usize, height: usize) -> Vec<u8> {
+    if frame.width == width && frame.height == height {
+        return frame.pixels;
+    }
+    // Black in YUYV is Y=0x10, C=0x80; fill by doubling instead of per pixel.
+    let mut canvas = vec![0x10, 0x80];
+    while canvas.len() < width * height * 2 {
+        let len = canvas.len();
+        canvas.extend_from_within(..len.min(width * height * 2 - len));
     }
     let copy_w = frame.width.min(width);
     let copy_h = frame.height.min(height);
@@ -345,7 +351,7 @@ mod tests {
             height: 2,
             pixels: vec![0x42; 4 * 2 * 2],
         };
-        let canvas = letterbox(&frame, 8, 4);
+        let canvas = letterbox(frame, 8, 4);
         assert_eq!(canvas.len(), 8 * 4 * 2);
         // Row 1 (second row) holds the first source row, columns 2..6.
         let row = &canvas[8 * 2..8 * 2 * 2];

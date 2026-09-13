@@ -324,7 +324,7 @@ fn capture<T: UsbContext + 'static>(
                         let pixels = if native {
                             frame.pixels
                         } else {
-                            frame::letterbox(&frame, frame::MAX_WIDTH, frame::MAX_HEIGHT)
+                            frame::letterbox(frame, frame::MAX_WIDTH, frame::MAX_HEIGHT)
                         };
                         if frame_sender.try_send(pixels).is_err() {
                             dropped_frames += 1;
