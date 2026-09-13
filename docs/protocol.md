@@ -150,11 +150,24 @@ from the data rate alone.
 
 With a silent source every sample sits at a constant `1`, not `0`.
 
-One caveat remains: the measured peak amplitude was 264 of 32767, about 0.8 %
-of full scale, although the sink was set to 40 %. Whether the box attenuates
-the level or the volume did not apply after the profile switch is unresolved.
-It does not affect the format determination, but it matters for later gain
-staging.
+Level check: a tone generated at amplitude 0.5 (-6 dBFS) with the sink at
+100 % arrived with a peak of 16363 of 32767, that is 49.9 % of full scale.
+The box passes audio at unity gain. (An earlier run measured only 264 because
+FFmpeg's `sine` source emits at one eighth of full scale and the sink stood at
+40 %; that was the test signal, not the device.)
+
+### OBS and other V4L2 clients
+
+`tools/hd60s-obs` feeds the frames into a v4l2loopback device and the audio
+into a PipeWire null sink, so OBS sees a camera named "Elgato HD60 S" and a
+source "Monitor of Elgato HD60 S". `tools/hd60s-obs.service` runs it as a
+systemd user unit; the header of that file shows a udev rule that starts it
+on hotplug. The loopback module needs `exclusive_caps=1`, otherwise browsers
+and OBS list the device but refuse to open it:
+
+```text
+options v4l2loopback devices=1 video_nr=10 card_label="Elgato HD60 S" exclusive_caps=1
+```
 
 ### In practice
 

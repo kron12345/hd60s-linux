@@ -29,6 +29,11 @@ writes the embedded audio as raw `s16le` stereo 48 kHz. The USB read runs in
 its own thread because the hardware drops data during any pause between
 transfers.
 
+For OBS, browsers and other V4L2 clients, `tools/hd60s-obs` feeds video into a
+v4l2loopback device and audio into a PipeWire sink; `tools/hd60s-obs.service`
+keeps it running as a systemd user unit. See `docs/protocol.md` for the
+module options.
+
 ## USB characterization
 
 The `hd60s-linux` binary locates the device and prints its configurations,
