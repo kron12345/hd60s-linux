@@ -3,96 +3,26 @@
 This document distinguishes observations from hypotheses. Add packet sequences
 only when a trace or repeatable experiment supports them.
 
-## Confirmed
+## History: the Rev. 2 development unit (July 2026)
 
-- Target product: original Elgato Game Capture HD60 S.
-- USB vendor/product ID on the initial test unit: `0fd9:005e`.
-- Initial test unit reports USB 3.0 and device version `25.4.15`.
-- Configuration 1 has two vendor-specific (`ff/00/00`) interfaces.
-- Interface 0 endpoint `0x83` is IN and offers:
-  - alternate setting 0 with isochronous maximum packet size 0;
-  - alternate settings 1 through 3 with isochronous maximum packet size 1024;
-  - alternate setting 4 as bulk with maximum packet size 1024.
-- Interface 1 has interrupt IN endpoint `0x81`, maximum packet size 64 and
-  interval 7.
-- The device does not expose a Linux V4L2 node through `uvcvideo`.
-- HDMI passthrough operates independently of a Linux capture driver.
+The project started on a Rev. 2 unit (`0fd9:005e`, firmware `25.4.15`).
+Read-only probing established the USB topology — configuration 1 with
+two vendor-specific interfaces, endpoint `0x83` with isochronous
+alternate settings 1–3 and bulk alternate setting 4, interrupt endpoint
+`0x81` on interface 1 — and that neither endpoint delivered anything
+without a host sequence: claiming interface 1 saw no interrupt packets,
+selecting bulk alternate setting 4 saw zero transfers, and the direct
+class/interface read of bank `0x98` register `0x3b` (`hd60s-linux
+startup-status`) got an I/O error. Static analysis of the Windows driver
+(`vendor-driver-analysis.md`) recovered the register transports — the
+direct form (request `0xc0`, `wValue` bank, `wIndex` register) and the
+MCU-proxied form through `wValue 0x5066` — and a PnP sequence with an
+MCU-presence handshake; replaying it blind was deliberately avoided.
 
-## Unknown
-
-- Runtime meaning and ordering of the PnP-time class control requests.
-- Whether runtime firmware is uploaded by the host.
-- Video transport: encoded, raw, or proprietary framing.
-- Audio transport and clock source.
-- Signal detection and resolution negotiation messages.
-- Start, stop, reset, and error-recovery sequences.
-
-## Experiment log
-
-- A read-only attempt to open the device and claim interface 1 appeared to block
-  for more than 30 seconds and was terminated before stage logging was added.
-  The device enumerated normally afterward.
-- A subsequent instrumented run confirmed no kernel driver was bound, claimed
-  interface 1 successfully, and received zero unsolicited packets from interrupt
-  endpoint `0x81` over three seconds.
-- A bounded read claimed interface 0, selected advertised bulk alternate setting
-  4, and received zero transfers from endpoint `0x83` over three seconds. The
-  alternate setting change completed normally and the local capture was empty.
-- Together, the endpoint observations indicate that a host control sequence must
-  arm notifications and streaming before either endpoint becomes active.
-- A reconstructed direct-form class-interface read for bank `0x0098`, register
-  `0x003b` was attempted with a one-second libusb timeout. The power-on device
-  rejected it with an I/O error and continued to enumerate normally afterward.
-  Later static analysis showed that the official Rev. 2 PnP path can select an
-  MCU-proxied register transport instead. The failure therefore rejects the
-  direct framing in this state; it does not by itself prove that a simple enable
-  write is missing.
-
-## Statically recovered register transport variants
-
-The Windows driver has direct and MCU-proxied variants behind the same generic
-register helpers. These are static facts awaiting runtime trace confirmation on
-the development device.
-
-- Direct access uses request `0xc0`, `wValue` as bank, `wIndex` as register, and
-  the register payload directly.
-- A proxied write to bank `0x98` or `0x9c` uses class-interface OUT request
-  `0xc0`, `wValue` `0x5098` or `0x509c`, `wIndex` zero, and a payload beginning
-  with the register followed by its data.
-- A proxied read first uses class-interface OUT request `0xc0`, `wValue`
-  `0x5066`, `wIndex` zero. A one-byte bank `0x98`, register `0x3b` read is encoded
-  as payload `99 01 3b`. A class-interface IN request with value `0x5066` then
-  obtains the response.
-
-The official Rev. 2 PnP branch reaches MCU-presence and internal-register logic
-before normal HDMI register access. That surrounding sequence remains
-prohibited from live replay until it appears in a normal official-driver trace.
-
-## Trace experiment matrix
-
-Record each experiment from USB connection through clean capture shutdown:
-
-| ID | HDMI input | Capture mode | Action |
-|---|---|---|---|
-| T00 | disconnected | none | enumerate only |
-| T01 | 720p60 SDR | preview | start, 10 seconds, stop |
-| T02 | 1080p30 SDR | preview | start, 10 seconds, stop |
-| T03 | 1080p60 SDR | preview | start, 10 seconds, stop |
-| T04 | 1080p60 SDR | preview | disconnect/reconnect HDMI |
-
-For every trace, record device revision, firmware version, input generator,
-driver version, application version, and SHA-256 checksum. Do not publish a
-trace until serial strings and potentially identifying payloads are removed.
-
-## Analysis method
-
-1. Separate enumeration, initialization, steady-state streaming, and shutdown.
-2. Diff control transfers across T00 through T03.
-3. Identify endpoint direction, transfer type, packet size, and cadence.
-4. Search payloads for MPEG-TS sync bytes, H.264 start codes, JPEG markers,
-   audio frame headers, counters, and timestamps.
-5. Replay the smallest confirmed initialization prefix with libusb.
-6. Treat every unexplained write as unsafe until its effect is understood.
+Everything below was then measured on a Rev. 4 unit, where the proxied
+form and the plug-in sequence turned out to be exactly what the static
+analysis predicted. Whether Rev. 2 needs an extra enable step, or
+something else was in the way, is still open (`roadmap.md`).
 
 ## Rev. 4 (`0fd9:0076`): confirmed video and audio transport
 
@@ -100,7 +30,7 @@ Everything in this section was measured on a Rev. 4 device (`0fd9:0076`,
 firmware `25.4.15`, the same firmware version as the Rev. 2 development unit).
 It is reproducible and not derived from the Windows driver.
 
-### No initialization command is needed
+### Streaming needs no initialization
 
 On this device it is enough to claim interface 0 and select alternate setting
 4 (bulk). Endpoint `0x83` then delivers data immediately, without any control
@@ -108,8 +38,8 @@ transfer, MCU handshake or register access. A five-second read returned
 1,298,923,520 bytes, about 260 MB/s.
 
 This differs from the Rev. 2 observation, where the same sequence produced zero
-transfers. Whether Rev. 2 really needs an enable step, or something else was in
-the way there, is open.
+transfers. The microcontroller proxy, unlike the stream, does need the
+driver's plug-in sequence first; see below.
 
 ### Framing
 
@@ -156,14 +86,11 @@ The box passes audio at unity gain. (An earlier run measured only 264 because
 FFmpeg's `sine` source emits at one eighth of full scale and the sink stood at
 40 %; that was the test signal, not the device.)
 
-### OBS and other V4L2 clients
+### Software without PipeWire
 
-`tools/hd60s-obs` feeds the frames into a v4l2loopback device and the audio
-into a PipeWire null sink, so OBS sees a camera named "Elgato HD60 S" and a
-source "Monitor of Elgato HD60 S". `tools/hd60s-obs.service` runs it as a
-systemd user unit; the header of that file shows a udev rule that starts it
-on hotplug. The loopback module needs `exclusive_caps=1`, otherwise browsers
-and OBS list the device but refuse to open it:
+`hd60s-linux capture` piped into `ffmpeg -f v4l2 /dev/video10` feeds a
+v4l2loopback device. The module needs `exclusive_caps=1`, otherwise
+browsers and OBS list the device but refuse to open it:
 
 ```text
 options v4l2loopback devices=1 video_nr=10 card_label="Elgato HD60 S" exclusive_caps=1
@@ -190,11 +117,15 @@ as target; PipeWire 1.6 ignores a numeric id there.
 hd60s-linux capture | ffmpeg -f rawvideo -pix_fmt yuyv422 -s 1920x1080 -r 60 -i - ...
 ```
 
-Reading must run in its own thread. Decoding between two `read_bulk` calls
-makes the hardware discard data during that pause: in that form only 29.1
-complete fps arrived, with 308 incomplete frames in 10 seconds. With a
-decoupled reader thread and 1 MB buffers it is 57.8 to 59.6 fps with 0 to 19
-incomplete frames.
+The device discards data during any gap between transfers. Decoding
+between two synchronous `read_bulk` calls delivered only 29.1 complete fps
+(308 incomplete frames in 10 s); a separate reader thread with 1 MB buffers
+57.8 to 59.6 fps; and even then every register read from another thread
+widened the gap between one read's completion and the next submission
+(56.1 fps, 230 damaged frames in 60 s with the panel and the tray active).
+Eight asynchronous 1 MB transfers kept queued in the kernel and resubmitted
+from their completion callbacks close the gap for good: 59.96 fps and no
+damaged frames under the same load (`pump::bulk_reader`).
 
 ### What the official driver does (usbmon trace of a Windows VM, Rev. 4)
 
@@ -391,16 +322,15 @@ size across source changes; `capture --native` writes frames at source size.
 
 ### Still open
 
-- Interlaced sources (the F bit is parsed but not yet used); the sources
-  available here are all progressive.
-- Behaviour on signal loss, with an HDCP-protected source, and on a resolution
-  change while streaming.
+- Interlaced sources (the F bit is parsed but not yet used); every source
+  available here is progressive.
+- Behaviour with an HDCP-protected source.
 - Purpose of the isochronous alternate settings 1 and 3 (the official
   application uses 2).
-- Meaning of interrupt endpoint `0x81`, which stayed silent even under the
-  official driver and application.
+- Interrupt endpoint `0x81`, silent even under the official driver and
+  application (which disarms event reporting with `0xc6`).
 - Whether Rev. 1 to 3 stream without initialization as well.
 - Whether register access from a second handle next to a stream is harmful
-  by itself (the hang seen on 2026-09-13 is explained by the missing plug-in
-  sequence; see above).
+  by itself (the hang of 2026-09-13 is explained by the missing plug-in
+  sequence).
 - Meaning of the `0xec` payload and of requests `0xc2` and `0xc7`.
