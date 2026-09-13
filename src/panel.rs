@@ -284,40 +284,45 @@ fn apply(shared: &Shared, request: &Request) -> Result<String, String> {
     ))
 }
 
-/// Converts the latest 1920x1080 YUYV frame into a 640x360 JPEG.
-fn preview(shared: &Shared) -> Option<Vec<u8>> {
+/// Converts the latest 1920x1080 YUYV frame to a JPEG, at full size or
+/// reduced by an integer factor with a box filter (BT.709, limited range).
+fn preview(shared: &Shared, factor: usize, quality: u8) -> Option<Vec<u8>> {
     let frame = shared.latest.lock().unwrap().clone()?;
     const SRC_W: usize = crate::frame::MAX_WIDTH;
     const SRC_H: usize = crate::frame::MAX_HEIGHT;
-    const W: usize = SRC_W / 3;
-    const H: usize = SRC_H / 3;
     if frame.len() != SRC_W * SRC_H * 2 {
         return None;
     }
-    let mut rgb = vec![0_u8; W * H * 3];
-    for y in 0..H {
-        let row = &frame[y * 3 * SRC_W * 2..];
-        for x in 0..W {
-            let sx = x * 3;
-            let pair = (sx / 2) * 4;
-            let luma = row[pair + if sx % 2 == 0 { 0 } else { 2 }] as f32;
-            let u = row[pair + 1] as f32 - 128.0;
-            let v = row[pair + 3] as f32 - 128.0;
-            // BT.709, limited range.
-            let yy = (luma - 16.0) * 1.164;
-            let r = yy + 1.793 * v;
-            let g = yy - 0.213 * u - 0.533 * v;
-            let b = yy + 2.112 * u;
-            let at = (y * W + x) * 3;
-            rgb[at] = r.clamp(0.0, 255.0) as u8;
-            rgb[at + 1] = g.clamp(0.0, 255.0) as u8;
-            rgb[at + 2] = b.clamp(0.0, 255.0) as u8;
+    let factor = factor.clamp(1, 8);
+    let (w, h) = (SRC_W / factor, SRC_H / factor);
+    let mut rgb = vec![0_u8; w * h * 3];
+    let samples = (factor * factor) as f32;
+    for y in 0..h {
+        for x in 0..w {
+            let (mut sy, mut su, mut sv) = (0.0_f32, 0.0_f32, 0.0_f32);
+            for dy in 0..factor {
+                let row = &frame[(y * factor + dy) * SRC_W * 2..];
+                for dx in 0..factor {
+                    let sx = x * factor + dx;
+                    let pair = (sx / 2) * 4;
+                    sy += row[pair + if sx.is_multiple_of(2) { 0 } else { 2 }] as f32;
+                    su += row[pair + 1] as f32;
+                    sv += row[pair + 3] as f32;
+                }
+            }
+            let luma = (sy / samples - 16.0) * 1.164;
+            let u = su / samples - 128.0;
+            let v = sv / samples - 128.0;
+            let at = (y * w + x) * 3;
+            rgb[at] = (luma + 1.793 * v).clamp(0.0, 255.0) as u8;
+            rgb[at + 1] = (luma - 0.213 * u - 0.533 * v).clamp(0.0, 255.0) as u8;
+            rgb[at + 2] = (luma + 2.112 * u).clamp(0.0, 255.0) as u8;
         }
     }
-    let mut out = Vec::new();
-    let encoder = jpeg_encoder::Encoder::new(&mut out, 80);
+    let mut out = Vec::with_capacity(w * h / 2);
+    let encoder = jpeg_encoder::Encoder::new(&mut out, quality.clamp(30, 100));
     encoder
-        .encode(&rgb, W as u16, H as u16, jpeg_encoder::ColorType::Rgb)
+        .encode(&rgb, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)
         .ok()?;
     Some(out)
 }
@@ -388,7 +393,11 @@ fn handle(mut stream: TcpStream, shared: Arc<Shared>) {
                 ),
             }
         }
-        ("GET", "/preview.jpg") => match preview(&shared) {
+        ("GET", "/preview.jpg") => match preview(
+            &shared,
+            request.number("scale").map(usize::from).unwrap_or(1),
+            request.number("quality").unwrap_or(88),
+        ) {
             Some(jpeg) => respond(&mut stream, "200 OK", "image/jpeg", &jpeg),
             None => respond(&mut stream, "204 No Content", "text/plain", b""),
         },

@@ -88,6 +88,16 @@ the card's USB controller until it is unplugged (see `docs/protocol.md`).
 If that ever happens: unplug the USB cable for a few seconds and plug it
 back — a USB reset is not enough — then use a current build.
 
+### Tray icon
+
+`serve` also puts an icon into the system tray (a StatusNotifierItem over
+D-Bus, so it shows in Plasma, in waybar under sway, and in other panels
+that speak the protocol; `--tray off` disables it). The dot is grey without
+a card, amber with a card but no HDMI signal, green while streaming; the
+tooltip shows the input, frame rate and counters. Clicking it opens the
+control panel; the menu offers mute, picture reset, the colour range and
+quit. Without a session bus or a tray host the icon is simply not shown.
+
 ### Diagnostics
 
 ```bash

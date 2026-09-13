@@ -302,20 +302,30 @@ impl Control {
         if MCU_FORBIDDEN.contains(&command) || !MCU_STATUS.iter().any(|(c, _)| *c == command) {
             return Err(format!("MCU command {command:#04x} is not permitted"));
         }
+        // What the buffer held before the command: a reply is only accepted
+        // once it differs from this and has stopped changing; if it never
+        // differs (the same command asked twice) the stable value is taken
+        // after the deadline.
+        let mut before = [0_u8; 3];
+        self.read(MCU_PROXY, 0, &mut before)?;
         self.write(MCU_PROXY, 0, &[0xab, 0x03, 0x12, 0x34, command])?;
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(100));
+        let started = std::time::Instant::now();
         let mut reply = [0_u8; 3];
         self.read(MCU_PROXY, 0, &mut reply)?;
-        for _ in 0..15 {
+        loop {
             std::thread::sleep(Duration::from_millis(30));
             let mut again = [0_u8; 3];
             self.read(MCU_PROXY, 0, &mut again)?;
-            if again == reply {
+            let stable = again == reply;
+            reply = again;
+            if stable && (reply != before || started.elapsed() > Duration::from_millis(800)) {
                 return Ok(reply);
             }
-            reply = again;
+            if started.elapsed() > Duration::from_millis(1500) {
+                return Ok(reply);
+            }
         }
-        Ok(reply)
     }
 
     /// The firmware build date the MCU reports to command 0x58, as

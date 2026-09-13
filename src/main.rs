@@ -1145,7 +1145,8 @@ fn main() -> ExitCode {
             Some(address) => Some(address.to_string()),
             None => Some("127.0.0.1:8060".to_string()),
         };
-        return match serve(&name, source, panel) {
+        let tray = !matches!(option("--tray").as_deref(), Some("off") | Some("none"));
+        return match serve(&name, source, panel, tray) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("error: {error}");
@@ -1159,7 +1160,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "error: usage: hd60s-linux [status|signal|picture|audio|edid|mcu|report|serve|observe|observe-stream|observe-iso|capture] \\
                  [SECONDS] [--audio FILE] [--native]\n       picture [--range bypass|shrink|expand] \\
-                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]\n       serve [--name NAME] [--panel ADDR|off] [--from-file RAW [--fps N]]\n       report [--show-serial] [--no-capture]"
+                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]\n       serve [--name NAME] [--panel ADDR|off] [--tray off] [--from-file RAW [--fps N]]\n       report [--show-serial] [--no-capture]"
             );
             return ExitCode::FAILURE;
         }

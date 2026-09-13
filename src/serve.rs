@@ -107,7 +107,7 @@ impl Shared {
 }
 
 /// Runs the camera and the audio source until the process is terminated.
-pub fn serve(name: &str, source: Source, panel: Option<String>) -> Result<(), String> {
+pub fn serve(name: &str, source: Source, panel: Option<String>, tray: bool) -> Result<(), String> {
     pw::init();
     let shared = Arc::new(Shared {
         latest: Mutex::new(None),
@@ -124,13 +124,19 @@ pub fn serve(name: &str, source: Source, panel: Option<String>) -> Result<(), St
         run_stop: Mutex::new(None),
         message: Mutex::new(None),
     });
-    if let Some(address) = panel {
+    if let Some(address) = &panel {
         let panel_shared = shared.clone();
+        let address = address.clone();
         std::thread::spawn(move || {
             if let Err(error) = crate::panel::run(&address, panel_shared) {
                 eprintln!("panel: {error}");
             }
         });
+    }
+    if tray {
+        let tray_shared = shared.clone();
+        let url = panel.as_ref().map(|address| format!("http://{address}/"));
+        std::thread::spawn(move || crate::tray::run(tray_shared, url));
     }
 
     // Pump: device or file → shared state.

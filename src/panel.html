@@ -37,7 +37,7 @@
   <div>
     <div class="card">
       <h2>Preview</h2>
-      <img id="preview" alt="preview">
+      <a id="previewlink" href="/preview.jpg" target="_blank" title="Open the full-size frame in a new tab"><img id="preview" alt="preview"></a>
       <div class="kv" style="margin-top:10px">
         <dt>Input</dt><dd id="timing">–</dd>
         <dt>Stream</dt><dd id="stream">–</dd>
@@ -123,6 +123,7 @@ async function refresh(){
   } catch (e) { $("devtext").textContent = "panel unreachable"; $("devdot").className = "dot bad"; }
 }
 function refreshPreview(){ const img = $("preview"); const next = new Image(); next.onload = () => { img.src = next.src; }; next.src = "/preview.jpg?t=" + Date.now(); }
+// Full resolution, scaled by the browser: the card's picture is meant to be readable here.
 refresh(); setInterval(refresh, 1500); refreshPreview(); setInterval(refreshPreview, 400);
 </script>
 </body>
