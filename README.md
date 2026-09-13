@@ -98,6 +98,48 @@ autostart choices:
 Uninstalling the package leaves nothing running; the autostart entry or
 the enabled unit are plain files in your home directory.
 
+### Headless: no desktop, a box for OBS or Frigate
+
+`hd60s-linux serve` needs no desktop, only a PipeWire user session. Let
+the user's services run without a login and enable the unit:
+
+```bash
+sudo loginctl enable-linger "$USER"
+systemctl --user enable --now hd60s-serve.service
+```
+
+Start options go into `~/.config/hd60s-linux/serve.conf` (`key = value`,
+the same names as the flags; flags on the command line win), for example:
+
+```ini
+panel = on            # web panel and HTTP API on 127.0.0.1:8060
+stream = on           # MJPEG for Frigate/go2rtc on 0.0.0.0:8061
+stream-token = secret
+record-dir = /srv/recordings
+record-encoder = vaapi
+```
+
+The running service is driven from the shell with `hd60s-linux ctl`
+(over the Unix socket, no token):
+
+```bash
+hd60s-linux ctl status
+hd60s-linux ctl picture --brightness 140 --range bypass
+hd60s-linux ctl mute            # gain 0; unmute = gain 128
+hd60s-linux ctl record start    # ... ctl record stop
+hd60s-linux ctl stream on
+hd60s-linux ctl snapshot now.jpg
+hd60s-linux ctl edid dump card.bin
+hd60s-linux ctl report
+hd60s-linux ctl json            # the whole state for scripts
+```
+
+All `serve` options: `--name NAME`, `--panel on|ADDR`, `--tray on`,
+`--record-dir DIR`, `--record-encoder auto|x264|vaapi`, `--stream on`,
+`--stream-bind ADDR|off`, `--stream-fps N`, `--stream-scale N`,
+`--stream-token T`, `--from-file RAW [--fps N]`. The control program
+takes `--tray` (start minimised to the tray).
+
 ### Control panel
 
 With `--panel on` (or `--panel ADDR`) `serve` also serves a web version of

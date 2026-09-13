@@ -433,6 +433,14 @@ pub fn run_unix(path: &std::path::Path, shared: Arc<Shared>) -> Result<(), Strin
     if let Some(dir) = path.parent() {
         let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
     }
+    // Never take the socket from a live instance (a second `serve` would
+    // otherwise cut the first one off from its clients).
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return Err(format!(
+            "another instance already serves {}; this one offers no API socket",
+            path.display()
+        ));
+    }
     let _ = std::fs::remove_file(path);
     let listener = std::os::unix::net::UnixListener::bind(path)
         .map_err(|error| format!("binding the API socket {}: {error}", path.display()))?;

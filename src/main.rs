@@ -1065,6 +1065,15 @@ fn main() -> ExitCode {
         Some("status") => Ok(Operation::Status),
         _ => Ok(Operation::Inspect),
     };
+    if arguments.first().map(String::as_str) == Some("ctl") {
+        return match hd60s_linux::client::ctl(&arguments[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if arguments.first().map(String::as_str) == Some("report") {
         let capture = if arguments.iter().any(|a| a == "--no-capture") {
             0
@@ -1075,6 +1084,12 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if arguments.first().map(String::as_str) == Some("serve") {
+        // Flags first, then the configuration file's defaults.
+        let arguments = arguments
+            .iter()
+            .cloned()
+            .chain(hd60s_linux::client::serve_config_arguments())
+            .collect::<Vec<_>>();
         let option = |flag: &str| {
             arguments
                 .iter()
@@ -1166,9 +1181,9 @@ fn main() -> ExitCode {
         Ok(operation) => operation,
         Err(_) => {
             eprintln!(
-                "error: usage: hd60s-linux [status|signal|picture|audio|edid|mcu|report|serve|observe|observe-stream|observe-iso|capture] \\
+                "error: usage: hd60s-linux [status|signal|picture|audio|edid|mcu|report|serve|ctl|observe|observe-stream|observe-iso|capture] \\
                  [SECONDS] [--audio FILE] [--native]\n       picture [--range bypass|shrink|expand] \\
-                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]\n       serve [--name NAME] [--panel on|ADDR] [--tray on] [--record-dir DIR] [--record-encoder auto|x264|vaapi] [--stream on|off] [--stream-bind ADDR|off] [--stream-fps N] [--stream-scale N] [--stream-token T] [--from-file RAW [--fps N]]\n       report [--show-serial] [--no-capture]"
+                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]\n       serve [--name NAME] [--panel on|ADDR] [--tray on] [--record-dir DIR] [--record-encoder auto|x264|vaapi] [--stream on|off] [--stream-bind ADDR|off] [--stream-fps N] [--stream-scale N] [--stream-token T] [--from-file RAW [--fps N]]\n       report [--show-serial] [--no-capture]\n       ctl status|json|picture [--brightness N ...] [--range bypass|shrink|expand]|range R|gain N|mute|unmute|reset|record start|stop|stream on|off|edid restore|dump FILE|snapshot FILE|report"
             );
             return ExitCode::FAILURE;
         }
