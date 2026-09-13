@@ -239,7 +239,10 @@ detected input timing as little-endian 16-bit words; with a 1080p60 source:
 
 Unplugging the HDMI cable zeroes bytes 4–12 within the 100 ms poll interval;
 plugging it back restores them about nine seconds later. `hd60s-linux signal
-[SECONDS]` reads and watches this. Bytes 13 (`0x12`) and 14 (`0x30`) did not
+[SECONDS]` reads and watches this. Unplugging and replugging the HDMI
+**output** (the pass-through to a monitor) changes nothing: no register
+moves, the strip stays dark, the stream continues. The box does not watch
+its output, which matches it presenting its own EDID to the source. Bytes 13 (`0x12`) and 14 (`0x30`) did not
 change with the signal; their meaning is open. The bulk stream survived the
 unplug; the feeder service did not need a restart.
 

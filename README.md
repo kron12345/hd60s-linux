@@ -27,7 +27,9 @@ cargo run --release -- capture | \
 `capture SECONDS` stops after a bounded time; `--audio FILE` additionally
 writes the embedded audio as raw `s16le` stereo 48 kHz. The USB read runs in
 its own thread because the hardware drops data during any pause between
-transfers.
+transfers, and the outputs are written from their own threads: a consumer
+that stalls costs frames (counted in the periodic statistics) but never
+blocks the capture.
 
 For OBS, browsers and other V4L2 clients, `tools/hd60s-obs` feeds video into a
 v4l2loopback device and audio into a PipeWire sink; `tools/hd60s-obs.service`

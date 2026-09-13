@@ -13,6 +13,8 @@ StartLimitBurst=5
 ExecStart=%h/Projekte/hd60s-linux/tools/hd60s-obs
 Restart=on-failure
 RestartSec=3
+# FFmpeg can ignore SIGTERM while blocked on an output; do not wait long.
+TimeoutStopSec=5
 
 [Install]
 WantedBy=default.target

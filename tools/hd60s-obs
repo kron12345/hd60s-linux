@@ -35,8 +35,13 @@ exec 3<>"$fifo"
 v4l2-ctl -d "$video_dev" -p 60 >/dev/null 2>&1 || true
 
 echo "feeding $video_dev (video) and sink '$sink' (audio) from $bin" >&2
+# Both inputs are fully described on the command line; skipping FFmpeg's
+# probing shortens startup. (The capture itself never blocks on its outputs,
+# which is what keeps the two-input pipeline from deadlocking.)
 "$bin" capture --audio "$fifo" | ffmpeg -hide_banner -loglevel warning -nostats \
-  -thread_queue_size 1024 -f s16le -ar 48000 -ac 2 -i "$fifo" \
-  -thread_queue_size 1024 -f rawvideo -pix_fmt yuyv422 -s 1920x1080 -r 60 -i - \
+  -probesize 32 -analyzeduration 0 -thread_queue_size 1024 \
+  -f s16le -ar 48000 -ac 2 -i "$fifo" \
+  -probesize 32 -analyzeduration 0 -thread_queue_size 1024 \
+  -f rawvideo -pix_fmt yuyv422 -s 1920x1080 -r 60 -i - \
   -map 1:v -c:v rawvideo -pix_fmt yuyv422 -fps_mode passthrough -f v4l2 "$video_dev" \
   -map 0:a -c:a pcm_s16le -f pulse -device "$sink" "HD60 S capture"

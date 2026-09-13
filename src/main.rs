@@ -226,19 +226,46 @@ fn capture<T: UsbContext + 'static>(
         .set_alternate_setting(0, 4)
         .map_err(|error| format!("selecting interface 0 alternate setting 4: {error}"))?;
 
-    let mut audio_file = match audio_path {
+    let audio_file = match audio_path {
         Some(path) => {
             Some(File::create(path).map_err(|error| format!("creating {path}: {error}"))?)
         }
         None => None,
     };
 
-    let mut stdout = std::io::BufWriter::with_capacity(frame::FRAME_BYTES, std::io::stdout());
+    // Writers run on their own threads with bounded queues, so a slow or
+    // stalled consumer costs frames but never blocks decoding. Blocking here
+    // would stop the audio and video outputs together and can deadlock a
+    // consumer that waits for one before reading the other.
+    let write_error = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let (frame_sender, frame_receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(3);
+    let frame_error = write_error.clone();
+    let frame_writer = std::thread::spawn(move || {
+        let mut stdout = std::io::BufWriter::with_capacity(frame::FRAME_BYTES, std::io::stdout());
+        for pixels in frame_receiver {
+            if let Err(error) = stdout.write_all(&pixels).and_then(|()| stdout.flush()) {
+                *frame_error.lock().unwrap() = Some(format!("writing frame to stdout: {error}"));
+                break;
+            }
+        }
+    });
+    let (audio_sender, audio_receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(1024);
+    let audio_error = write_error.clone();
+    let audio_writer = std::thread::spawn(move || {
+        let Some(mut file) = audio_file else { return };
+        for bytes in audio_receiver {
+            if let Err(error) = file.write_all(&bytes) {
+                *audio_error.lock().unwrap() = Some(format!("writing audio: {error}"));
+                break;
+            }
+        }
+    });
+    let mut dropped_frames = 0_u64;
+    let mut dropped_audio = 0_u64;
     let mut assembler = Assembler::new();
     let started = Instant::now();
     let limit = seconds.map(Duration::from_secs);
     let mut reported = Instant::now();
-    let mut write_error: Option<String> = None;
 
     eprintln!(
         "capturing {}x{} yuyv422 from bulk endpoint 0x83",
@@ -279,18 +306,13 @@ fn capture<T: UsbContext + 'static>(
             Ok(chunk) => {
                 assembler.push(&chunk, |event| match event {
                     Event::Frame(pixels) => {
-                        if write_error.is_none()
-                            && let Err(error) = stdout.write_all(&pixels)
-                        {
-                            write_error = Some(format!("writing frame to stdout: {error}"));
+                        if frame_sender.try_send(pixels).is_err() {
+                            dropped_frames += 1;
                         }
                     }
                     Event::Audio(bytes) => {
-                        if let Some(file) = audio_file.as_mut()
-                            && write_error.is_none()
-                            && let Err(error) = file.write_all(&bytes)
-                        {
-                            write_error = Some(format!("writing audio: {error}"));
+                        if audio_path.is_some() && audio_sender.try_send(bytes).is_err() {
+                            dropped_audio += 1;
                         }
                     }
                 });
@@ -298,7 +320,7 @@ fn capture<T: UsbContext + 'static>(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => dropped += 1,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        if let Some(error) = write_error {
+        if let Some(error) = write_error.lock().unwrap().take() {
             // Consumer gone (for example FFmpeg exited): that is a normal end.
             eprintln!("stopping: {error}");
             break;
@@ -307,12 +329,14 @@ fn capture<T: UsbContext + 'static>(
             let stats = assembler.stats;
             let elapsed = started.elapsed().as_secs_f64();
             eprintln!(
-                "{} frame(s), {:.1} fps, {} audio block(s), {} short, {} unknown",
+                "{} frame(s), {:.1} fps, {} audio block(s), {} short, {} unknown, {}/{} dropped by consumer",
                 stats.frames,
                 stats.frames as f64 / elapsed,
                 stats.audio_blocks,
                 stats.short_frames,
-                stats.unknown_blocks
+                stats.unknown_blocks,
+                dropped_frames,
+                dropped_audio
             );
             reported = Instant::now();
         }
@@ -323,7 +347,17 @@ fn capture<T: UsbContext + 'static>(
     if let Ok(Err(error)) = reader.join() {
         eprintln!("reader thread: {error}");
     }
-    let _ = stdout.flush();
+    drop(frame_sender);
+    drop(audio_sender);
+    // The frame writer may sit in a write to a stalled consumer; every frame
+    // is flushed as it is written, so there is nothing to wait for.
+    drop(frame_writer);
+    let _ = audio_writer.join();
+    if dropped_frames > 0 || dropped_audio > 0 {
+        eprintln!(
+            "{dropped_frames} frame(s) and {dropped_audio} audio block(s) dropped by a slow consumer"
+        );
+    }
     if dropped > 0 {
         eprintln!("{dropped} read timeout(s)");
     }
