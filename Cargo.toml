@@ -19,6 +19,7 @@ pipewire-vircam = "0.7"
 rusb = "0.9.4"
 
 [package.metadata.deb]
+suggests = "ffmpeg"
 maintainer = "Sebastian Ortwein <kron@animeland.de>"
 extended-description = "Elgato Game Capture HD60 S as a PipeWire camera and microphone: a userspace driver, no kernel module."
 depends = "libpipewire-0.3-0, libusb-1.0-0, pipewire"

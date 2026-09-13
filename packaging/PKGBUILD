@@ -9,6 +9,7 @@ license=('MIT')
 # The libspa-sys C shim must not be compiled with GCC LTO: Rust links with lld.
 options=(!lto)
 depends=('libpipewire' 'libusb' 'pipewire')
+optdepends=('ffmpeg: recording from the panel or the tray')
 makedepends=('git' 'cargo' 'clang' 'pkgconf')
 provides=('hd60s-linux')
 conflicts=('hd60s-linux')
