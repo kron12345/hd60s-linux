@@ -93,3 +93,90 @@ trace until serial strings and potentially identifying payloads are removed.
    audio frame headers, counters, and timestamps.
 5. Replay the smallest confirmed initialization prefix with libusb.
 6. Treat every unexplained write as unsafe until its effect is understood.
+
+## Rev. 4 (`0fd9:0076`): confirmed video and audio transport
+
+Everything in this section was measured on a Rev. 4 device (`0fd9:0076`,
+firmware `25.4.15`, the same firmware version as the Rev. 2 development unit).
+It is reproducible and not derived from the Windows driver.
+
+### No initialization command is needed
+
+On this device it is enough to claim interface 0 and select alternate setting
+4 (bulk). Endpoint `0x83` then delivers data immediately, without any control
+transfer, MCU handshake or register access. A five-second read returned
+1,298,923,520 bytes, about 260 MB/s.
+
+This differs from the Rev. 2 observation, where the same sequence produced zero
+transfers. Whether Rev. 2 really needs an enable step, or something else was in
+the way there, is open.
+
+### Framing
+
+The stream is a sequence of BT.656-style timing reference codes:
+
+```text
+<ff 00 00 XY> <3840 B pixels, YUYV> [<12 B audio block>] <next ff 00 00 XY> ...
+```
+
+- `XY` has bit 7 set, followed by F, V and H, and carries the BT.656 protection
+  bits computed from F/V/H in its low four bits. Exactly two values were
+  observed: `0x80` (F=0 V=0 H=0, active line) and `0xab` (F=0 V=1 H=0, vertical
+  blanking). Both satisfy the parity, which separates real markers reliably
+  from a chance `ff 00 00` inside pixel data.
+- Pixels are YUV 4:2:2, 8 bit, in `Y U Y V` order. A black picture reads
+  `01 7f 01 7f ...`.
+- At 1080p60 a frame has **1125 lines, 1080 of them active**, the SMPTE 274M
+  raster. The frame period is **4,329,300 bytes**; times 60 that is 259.76 MB/s
+  and matches the measured throughput.
+- A frame starts where V changes from 1 to 0.
+
+### Embedded audio
+
+About 400 lines per frame carry, after the 3840 pixel bytes, an extra block of
+12 bytes: a 4-byte header `ff 00 ff 02` followed by 8 bytes of payload. Such a
+line is 3852 instead of 3840 bytes long.
+
+400 blocks per frame times 8 bytes times 60 fps is 192,000 bytes/s, exactly
+48 kHz stereo at 16 bit. Decoding as `s16le` stereo yields 2400 sample pairs
+for three frames, which is 50.0 ms, the duration of three frames at 60 fps.
+
+Confirmed with a sounding source on 2026-09-13: 1000 Hz on the left and 400 Hz
+on the right channel were fed into the HDMI input (Radeon RX 7900 host,
+PipeWire sink on the HDMI output the box is attached to). The blocks decoded as
+`s16le` stereo gave 999.4 Hz left and 399.9 Hz right. Sample rate, word size,
+signedness, byte order and channel order are therefore measured, not inferred
+from the data rate alone.
+
+With a silent source every sample sits at a constant `1`, not `0`.
+
+One caveat remains: the measured peak amplitude was 264 of 32767, about 0.8 %
+of full scale, although the sink was set to 40 %. Whether the box attenuates
+the level or the volume did not apply after the profile switch is unresolved.
+It does not affect the format determination, but it matters for later gain
+staging.
+
+### In practice
+
+`hd60s-linux capture` writes the frames raw to stdout:
+
+```bash
+hd60s-linux capture | ffmpeg -f rawvideo -pix_fmt yuyv422 -s 1920x1080 -r 60 -i - ...
+```
+
+Reading must run in its own thread. Decoding between two `read_bulk` calls
+makes the hardware discard data during that pause: in that form only 29.1
+complete fps arrived, with 308 incomplete frames in 10 seconds. With a
+decoupled reader thread and 1 MB buffers it is 57.8 to 59.6 fps with 0 to 19
+incomplete frames.
+
+### Still open
+
+- Behaviour with other input resolutions and frame rates, including interlaced
+  sources (the F bit is parsed but not yet used).
+- Behaviour on signal loss, with an HDCP-protected source, and on a resolution
+  change while streaming.
+- Purpose of the isochronous alternate settings 1 to 3.
+- Meaning of interrupt endpoint `0x81`, which stays silent without a control
+  sequence.
+- Whether Rev. 1 to 3 stream without initialization as well.

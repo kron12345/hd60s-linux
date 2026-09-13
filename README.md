@@ -1,14 +1,35 @@
 # hd60s-linux
 
 Experimental native Linux support for the **original** Elgato Game Capture
-HD60 S. This model uses USB ID `0fd9:005e` and is not a USB Video Class device.
-The HD60 S+ is different hardware and is outside this project's scope.
+HD60 S, which is not a USB Video Class device. The HD60 S+ is different
+hardware and is outside this project's scope.
 
-No working capture driver exists here yet. The first objective is to document
-the proprietary protocol without guessing, then implement it in userspace with
-libusb. Do not use this project for firmware updates.
+The official Windows driver serves four hardware revisions under one INF:
+`0fd9:004f`, `0fd9:005e` (Rev. 2), `0fd9:0074` (Rev. 3) and `0fd9:0076`
+(Rev. 4). All four are recognized here.
 
-## Current milestone: USB characterization
+**On Rev. 4 (`0fd9:0076`), `hd60s-linux capture` delivers 1080p60 video and
+48 kHz stereo audio without sending any vendor command.** The stream format is
+documented in `docs/protocol.md`. The Rev. 2 development unit returned no
+stream data under the same sequence, so the other revisions are not yet
+confirmed to work. The protocol is documented from measurements, not guessed.
+Do not use this project for firmware updates.
+
+## Capturing (Rev. 4)
+
+Frames are written raw to stdout as YUYV 4:2:2, 1920x1080, 60 Hz:
+
+```bash
+cargo run --release -- capture | \
+  ffmpeg -f rawvideo -pix_fmt yuyv422 -s 1920x1080 -r 60 -i - output.mkv
+```
+
+`capture SECONDS` stops after a bounded time; `--audio FILE` additionally
+writes the embedded audio as raw `s16le` stereo 48 kHz. The USB read runs in
+its own thread because the hardware drops data during any pause between
+transfers.
+
+## USB characterization
 
 The `hd60s-linux` binary locates the device and prints its configurations,
 interfaces, alternate settings, and endpoints:
