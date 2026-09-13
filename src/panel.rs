@@ -160,6 +160,20 @@ fn state_json(shared: &Shared) -> String {
     if let Some(message) = shared.message.lock().unwrap().as_ref() {
         fields.push(format!("\"message\":{}", json_string(message)));
     }
+    match shared.recording_status() {
+        Some(status) => fields.push(format!(
+            "\"recording\":{{\"path\":{},\"seconds\":{:.0},\"bytes\":{},\"dropped\":{}}}",
+            json_string(&status.path.display().to_string()),
+            status.seconds,
+            status.bytes,
+            status.dropped_frames
+        )),
+        None => fields.push("\"recording\":null".to_string()),
+    }
+    fields.push(format!(
+        "\"record_dir\":{}",
+        json_string(&shared.record_dir.display().to_string())
+    ));
     let control = shared.control.lock().unwrap();
     let snapshot = shared.snapshot.lock().unwrap();
     match control.as_ref() {
@@ -360,6 +374,39 @@ fn handle(mut stream: TcpStream, shared: Arc<Shared>) {
                 })
             } else {
                 Err("nothing to do".into())
+            };
+            match result {
+                Ok(message) => respond(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    format!("{{\"ok\":true,\"message\":{}}}", json_string(&message)).as_bytes(),
+                ),
+                Err(error) => respond(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    "application/json",
+                    format!("{{\"ok\":false,\"error\":{}}}", json_string(&error)).as_bytes(),
+                ),
+            }
+        }
+        ("POST", "/api/record") => {
+            let result = if request.get("start").is_some() {
+                shared
+                    .start_recording()
+                    .map(|s| format!("recording to {}", s.path.display()))
+            } else if request.get("stop").is_some() {
+                shared.stop_recording().map(|s| {
+                    format!(
+                        "saved {} ({:.0} s, {} MB, {} frame(s) dropped)",
+                        s.path.display(),
+                        s.seconds,
+                        s.bytes / 1_000_000,
+                        s.dropped_frames
+                    )
+                })
+            } else {
+                Err("start=1 or stop=1".into())
             };
             match result {
                 Ok(message) => respond(

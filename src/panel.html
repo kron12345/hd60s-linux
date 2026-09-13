@@ -41,7 +41,9 @@
       <div class="kv" style="margin-top:10px">
         <dt>Input</dt><dd id="timing">–</dd>
         <dt>Stream</dt><dd id="stream">–</dd>
+        <dt>Recording</dt><dd id="recording">off</dd>
       </div>
+      <div class="buttons"><button id="recbtn">● Start recording</button></div>
     </div>
     <div class="card" style="margin-top:14px">
       <h2>Picture</h2>
@@ -95,6 +97,8 @@ for (const id of sliders.concat(["gain"])) {
 }
 $("range").addEventListener("change", () => post(`/api/set?range=${$("range").value}`));
 $("reset").addEventListener("click", () => post(`/api/set?reset=1`));
+let recording = false;
+$("recbtn").addEventListener("click", () => post(recording ? "/api/record?stop=1" : "/api/record?start=1").then(refresh));
 $("edidrestore").addEventListener("click", () => post(`/api/edid?restore=1`));
 $("reportbtn").addEventListener("click", async () => { const t = await (await fetch("/api/report")).text(); $("report").textContent = t; $("report").hidden = false; });
 function kv(el, pairs){ el.innerHTML = pairs.map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join(""); }
@@ -120,6 +124,10 @@ async function refresh(){
     if (s.edid) $("edid").textContent = s.edid.error || `${s.edid.summary} — ${s.edid.valid ? "valid" : "INVALID"}${s.edid.factory ? ", power-on block" : ", custom"}`;
     if (s.mcu) kv($("mcu"), s.mcu.map(m => [`${m.command} ${m.meaning}`, `<span class="mono">${m.reply}</span>`]).concat([["read", `${s.snapshot_age} s ago, before the stream started`]]));
     if (s.message && s.message !== lastMessage) { lastMessage = s.message; setMsg(s.message); }
+    recording = !!s.recording;
+    $("recbtn").textContent = recording ? "■ Stop recording" : "● Start recording";
+    $("recbtn").style.color = recording ? "var(--bad)" : "";
+    $("recording").textContent = s.recording ? `${s.recording.path} · ${Math.floor(s.recording.seconds/60)}:${String(Math.floor(s.recording.seconds%60)).padStart(2,"0")} · ${(s.recording.bytes/1e6).toFixed(0)} MB · ${s.recording.dropped} dropped` : `off · files go to ${s.record_dir}`;
   } catch (e) { $("devtext").textContent = "panel unreachable"; $("devdot").className = "dot bad"; }
 }
 function refreshPreview(){ const img = $("preview"); const next = new Image(); next.onload = () => { img.src = next.src; }; next.src = "/preview.jpg?t=" + Date.now(); }

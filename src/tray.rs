@@ -30,6 +30,7 @@ pub struct Tray {
     muted: bool,
     range: usize,
     device_known: bool,
+    recording: Option<crate::record::Status>,
 }
 
 impl Tray {
@@ -49,6 +50,7 @@ impl Tray {
         let fps = self.shared.recent_fps();
         let stats = *self.shared.stats.lock().unwrap();
         let geometry = *self.shared.geometry.lock().unwrap();
+        self.recording = self.shared.recording_status();
         // Without a control connection (a replayed recording) the stream
         // geometry stands in for the timing registers.
         let signal = match &timing {
@@ -78,6 +80,14 @@ impl Tray {
                 )
             }
         };
+        if let Some(recording) = &self.recording {
+            self.description = format!(
+                "{} · ● REC {}:{:02}",
+                self.description,
+                recording.seconds as u64 / 60,
+                recording.seconds as u64 % 60
+            );
+        }
     }
 
     fn open_panel(&self) {
@@ -171,6 +181,30 @@ impl ksni::Tray for Tray {
             }));
         }
         items.extend([
+            MenuItem::Standard(StandardItem {
+                label: match &self.recording {
+                    Some(r) => format!(
+                        "Stop recording ({}:{:02})",
+                        r.seconds as u64 / 60,
+                        r.seconds as u64 % 60
+                    ),
+                    None => "Start recording".into(),
+                },
+                enabled: self.state == State::Streaming || self.recording.is_some(),
+                activate: Box::new(|tray: &mut Self| {
+                    let result = if tray.recording.is_some() {
+                        tray.shared.stop_recording().map(|_| ())
+                    } else {
+                        tray.shared.start_recording().map(|_| ())
+                    };
+                    if let Err(error) = result {
+                        eprintln!("tray: {error}");
+                    }
+                    tray.refresh();
+                }),
+                ..Default::default()
+            }),
+            MenuItem::Separator,
             MenuItem::Checkmark(CheckmarkItem {
                 label: "Mute audio".into(),
                 checked: self.muted,
@@ -239,6 +273,7 @@ pub fn run(shared: Arc<Shared>, panel_url: Option<String>) {
         muted: false,
         range: 0,
         device_known: false,
+        recording: None,
     };
     tray.refresh();
     let handle = match tray.spawn() {

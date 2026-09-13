@@ -88,6 +88,17 @@ the card's USB controller until it is unplugged (see `docs/protocol.md`).
 If that ever happens: unplug the USB cable for a few seconds and plug it
 back — a USB reset is not enough — then use a current build.
 
+### Recording
+
+The panel's record button and the tray menu write the stream to a file:
+`ffmpeg` encodes the 1920x1080 frames and the audio to H.264 + AAC in a
+Matroska file named `HD60 S <date> <time>.mkv` in your Videos directory
+(`--record-dir DIR` changes that; `--record-encoder vaapi` uses the GPU's
+VA-API encoder instead of libx264). Frames the encoder cannot keep up with
+are dropped and counted rather than stalling the capture; the file is
+playable even if the service is killed while recording. `ffmpeg` must be
+installed. Scripts use `POST /api/record?start=1` and `?stop=1`.
+
 ### Tray icon
 
 `serve` also puts an icon into the system tray (a StatusNotifierItem over

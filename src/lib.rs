@@ -4,6 +4,7 @@ pub mod edid;
 pub mod frame;
 pub mod panel;
 pub mod pump;
+pub mod record;
 pub mod report;
 pub mod serve;
 pub mod trace;

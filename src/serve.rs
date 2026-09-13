@@ -21,6 +21,7 @@ use crate::control::{Control, Snapshot};
 use crate::device;
 use crate::frame::{self, letterbox};
 use crate::pump::{self, Input};
+use crate::record::{self, Recording};
 
 /// Where `serve` takes its stream from.
 pub enum Source {
@@ -61,9 +62,76 @@ pub struct Shared {
     run_stop: Mutex<Option<Arc<AtomicBool>>>,
     /// Outcome of the last deferred job, for the panel.
     pub message: Mutex<Option<String>>,
+    /// A running recording, if any.
+    pub recording: Mutex<Option<Recording>>,
+    pub record_dir: std::path::PathBuf,
+    pub record_encoder: record::Encoder,
 }
 
 impl Shared {
+    /// Starts recording to a new file in `record_dir`.
+    pub fn start_recording(&self) -> Result<record::Status, String> {
+        let mut slot = self.recording.lock().unwrap();
+        if slot.is_some() {
+            return Err("already recording".into());
+        }
+        if !self.device_present.load(Ordering::Relaxed) {
+            return Err("nothing to record: no stream".into());
+        }
+        let recording = Recording::start(
+            &self.record_dir,
+            self.record_encoder,
+            CANVAS_WIDTH,
+            CANVAS_HEIGHT,
+        )?;
+        let status = recording.status();
+        eprintln!("recording to {}", status.path.display());
+        *slot = Some(recording);
+        Ok(status)
+    }
+
+    pub fn stop_recording(&self) -> Result<record::Status, String> {
+        let recording = self
+            .recording
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or("not recording")?;
+        let result = recording.stop();
+        match &result {
+            Ok(status) => eprintln!(
+                "recording finished: {} ({:.0} s, {} MB, {} frame(s) dropped)",
+                status.path.display(),
+                status.seconds,
+                status.bytes / 1_000_000,
+                status.dropped_frames
+            ),
+            Err(error) => eprintln!("recording: {error}"),
+        }
+        result
+    }
+
+    /// Status of the running recording; clears it if ffmpeg has died.
+    pub fn recording_status(&self) -> Option<record::Status> {
+        let mut slot = self.recording.lock().unwrap();
+        let alive = slot.as_mut().map(|r| r.alive());
+        match alive {
+            Some(true) => slot.as_ref().map(|r| r.status()),
+            Some(false) => {
+                let dead = slot.take().unwrap();
+                let status = dead.status();
+                eprintln!(
+                    "recording ended unexpectedly (ffmpeg exited): {}",
+                    status.path.display()
+                );
+                *self.message.lock().unwrap() =
+                    Some("recording ended unexpectedly (ffmpeg exited)".into());
+                None
+            }
+            None => None,
+        }
+    }
+
     /// Schedules an EDID write. The EEPROM sits behind the microcontroller,
     /// which must not be talked to while streaming, so the stream is stopped,
     /// the block written, and the device picked up again.
@@ -107,7 +175,20 @@ impl Shared {
 }
 
 /// Runs the camera and the audio source until the process is terminated.
-pub fn serve(name: &str, source: Source, panel: Option<String>, tray: bool) -> Result<(), String> {
+pub struct Options {
+    pub panel: Option<String>,
+    pub tray: bool,
+    pub record_dir: std::path::PathBuf,
+    pub record_encoder: record::Encoder,
+}
+
+pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String> {
+    let Options {
+        panel,
+        tray,
+        record_dir,
+        record_encoder,
+    } = options;
     pw::init();
     let shared = Arc::new(Shared {
         latest: Mutex::new(None),
@@ -123,6 +204,9 @@ pub fn serve(name: &str, source: Source, panel: Option<String>, tray: bool) -> R
         pending_edid: Mutex::new(None),
         run_stop: Mutex::new(None),
         message: Mutex::new(None),
+        recording: Mutex::new(None),
+        record_dir,
+        record_encoder,
     });
     if let Some(address) = &panel {
         let panel_shared = shared.clone();
@@ -148,9 +232,15 @@ pub fn serve(name: &str, source: Source, panel: Option<String>, tray: bool) -> R
             *shared.geometry.lock().unwrap() = (frame.width, frame.height);
             shared.note_frame();
             let pixels = letterbox(frame, CANVAS_WIDTH, CANVAS_HEIGHT);
+            if let Some(recording) = shared.recording.lock().unwrap().as_ref() {
+                recording.push_frame(&pixels);
+            }
             *shared.latest.lock().unwrap() = Some(pixels);
         };
         let on_audio = |shared: &Shared, bytes: Vec<u8>| {
+            if let Some(recording) = shared.recording.lock().unwrap().as_ref() {
+                recording.push_audio(&bytes);
+            }
             let mut ring = shared.audio.lock().unwrap();
             ring.extend(bytes);
             if ring.len() > AUDIO_RING_BYTES {
@@ -348,6 +438,9 @@ pub fn serve(name: &str, source: Source, panel: Option<String>, tray: bool) -> R
 
     stop.store(true, Ordering::Relaxed);
     shared.stop.store(true, Ordering::Relaxed);
+    if shared.recording.lock().unwrap().is_some() {
+        let _ = shared.stop_recording();
+    }
     let pump_result = pump_thread
         .join()
         .unwrap_or_else(|_| Err("pump thread panicked".into()));
