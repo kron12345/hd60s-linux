@@ -8,3 +8,4 @@ Icon=hd60s-control
 Terminal=false
 Categories=AudioVideo;Video;Settings;
 Keywords=Elgato;capture;HDMI;
+StartupWMClass=hd60s-control
