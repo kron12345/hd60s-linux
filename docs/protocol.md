@@ -223,6 +223,8 @@ private (they contain the serial and captured video).
     contrast nudge, presumably to make the receiver re-apply the controls.
   - The application never rewrites the EDID for any setting; it does not
     force an input resolution on the source.
+  - `hd60s-linux picture` reads and writes these two registers from Linux
+    with the same requests.
 - Before starting, the application reads the **EDID from bank `0xa0`**
   (256 bytes as 16 reads of 16 bytes at `wIndex` 0, 16, … 240), writes it
   back, then writes a version with the monitor name changed from "Elgato" to

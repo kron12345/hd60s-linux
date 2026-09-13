@@ -46,6 +46,16 @@ cargo run --release -- signal      # once
 cargo run --release -- signal 60   # watch, print changes
 ```
 
+Show or change the HDMI colour range and the picture controls — the same
+register writes the official application makes (bank `0x64`, registers
+`0x12` and `0x13`); values are 0–255 with 128 as neutral:
+
+```bash
+cargo run --release -- picture
+cargo run --release -- picture --range expanded --brightness 150
+cargo run --release -- picture --reset
+```
+
 ## USB characterization
 
 The `hd60s-linux` binary locates the device and prints its configurations,

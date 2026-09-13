@@ -32,6 +32,11 @@ const HDMI_REGISTER_BANK: u16 = 0x0098;
 const STARTUP_STATUS_REGISTER: u16 = 0x003b;
 /// Rev. 4 register bank the official driver polls for the input timing.
 const SIGNAL_REGISTER_BANK: u16 = 0x0064;
+/// Bank 0x64 register for the HDMI colour range: 0 = standard, 1 = expanded.
+const COLOUR_RANGE_REGISTER: u16 = 0x0012;
+/// Bank 0x64 register holding brightness, contrast, saturation and hue,
+/// one byte each with 0x80 as neutral.
+const PICTURE_REGISTER: u16 = 0x0013;
 
 fn transfer_name(transfer_type: TransferType) -> &'static str {
     match transfer_type {
@@ -395,6 +400,105 @@ fn capture<T: UsbContext + 'static>(
     Ok(())
 }
 
+/// Settings for the `picture` command; `None` leaves a value untouched.
+#[derive(Default, Clone)]
+struct PictureSettings {
+    range: Option<u8>,
+    controls: [Option<u8>; 4],
+    reset: bool,
+}
+
+/// Shows or changes the HDMI colour range and the picture controls, using
+/// exactly the register writes the official application makes:
+/// bank 0x64 register 0x12 for the range, register 0x13 (four bytes) for
+/// brightness, contrast, saturation and hue.
+fn picture<T: UsbContext>(device: Device<T>, settings: PictureSettings) -> Result<(), String> {
+    let handle = device
+        .open()
+        .map_err(|error| format!("opening device: {error}"))?;
+    let read_type = rusb::request_type(Direction::In, RequestType::Vendor, Recipient::Device);
+    let write_type = rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Device);
+    let timeout = Duration::from_secs(1);
+    let mut registers = [0_u8; 32];
+    let read_all = |registers: &mut [u8; 32]| -> Result<(), String> {
+        handle
+            .read_control(
+                read_type,
+                REGISTER_REQUEST,
+                SIGNAL_REGISTER_BANK,
+                0,
+                registers,
+                timeout,
+            )
+            .map(|_| ())
+            .map_err(|error| format!("reading bank 0x64 registers: {error}"))
+    };
+    read_all(&mut registers)?;
+
+    let mut controls = [
+        registers[PICTURE_REGISTER as usize],
+        registers[PICTURE_REGISTER as usize + 1],
+        registers[PICTURE_REGISTER as usize + 2],
+        registers[PICTURE_REGISTER as usize + 3],
+    ];
+    let mut changed = false;
+    if settings.reset {
+        controls = [0x80; 4];
+        changed = true;
+    }
+    for (slot, value) in controls.iter_mut().zip(settings.controls) {
+        if let Some(value) = value {
+            *slot = value;
+            changed = true;
+        }
+    }
+    if changed {
+        handle
+            .write_control(
+                write_type,
+                REGISTER_REQUEST,
+                SIGNAL_REGISTER_BANK,
+                PICTURE_REGISTER,
+                &controls,
+                timeout,
+            )
+            .map_err(|error| format!("writing picture controls: {error}"))?;
+    }
+    if let Some(range) = settings.range {
+        handle
+            .write_control(
+                write_type,
+                REGISTER_REQUEST,
+                SIGNAL_REGISTER_BANK,
+                COLOUR_RANGE_REGISTER,
+                &[range],
+                timeout,
+            )
+            .map_err(|error| format!("writing colour range: {error}"))?;
+    }
+
+    read_all(&mut registers)?;
+    let range = registers[COLOUR_RANGE_REGISTER as usize];
+    println!(
+        "colour range: {} ({range:#04x})",
+        match range {
+            0 => "standard",
+            1 => "expanded",
+            _ => "unset (power-on default)",
+        }
+    );
+    for (name, value) in ["brightness", "contrast", "saturation", "hue"]
+        .iter()
+        .zip(&registers[PICTURE_REGISTER as usize..PICTURE_REGISTER as usize + 4])
+    {
+        println!(
+            "{name:<11} {value:>3}{}",
+            if *value == 0x80 { "  (neutral)" } else { "" }
+        );
+    }
+    Ok(())
+}
+
 /// Reads bank 0x64 registers 0x00..0x1f the way the official driver polls them
 /// every 105 ms, and prints the detected input timing. With `seconds`, keeps
 /// watching and prints only changes.
@@ -489,6 +593,7 @@ enum Operation {
     ObserveStream(u64),
     Capture(Option<u64>, Option<String>, bool),
     Signal(Option<u64>),
+    Picture(PictureSettings),
     Status,
 }
 
@@ -513,6 +618,7 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
                     return capture(device, seconds, audio.as_deref(), native);
                 }
                 Operation::Signal(seconds) => return read_signal(device, seconds),
+                Operation::Picture(ref settings) => return picture(device, settings.clone()),
                 Operation::Status => return read_direct_startup_status(device),
                 Operation::Inspect => {}
             }
@@ -527,6 +633,33 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
         .collect::<Vec<_>>()
         .join(", ");
     Err(format!("no HD60 S found; looked for {known}"))
+}
+
+/// Parses `picture` options; values are 0..=255 with 128 as neutral.
+fn parse_picture(arguments: &[String]) -> Result<PictureSettings, std::num::ParseIntError> {
+    let mut settings = PictureSettings::default();
+    let mut iter = arguments.iter();
+    while let Some(argument) = iter.next() {
+        let value = |iter: &mut std::slice::Iter<String>| -> Result<u8, std::num::ParseIntError> {
+            iter.next().map(String::as_str).unwrap_or("").parse::<u8>()
+        };
+        match argument.as_str() {
+            "--reset" => settings.reset = true,
+            "--range" => {
+                settings.range = Some(match iter.next().map(String::as_str) {
+                    Some("standard" | "limited") => 0,
+                    Some("expanded" | "full") => 1,
+                    other => other.unwrap_or("").parse::<u8>()?,
+                })
+            }
+            "--brightness" => settings.controls[0] = Some(value(&mut iter)?),
+            "--contrast" => settings.controls[1] = Some(value(&mut iter)?),
+            "--saturation" => settings.controls[2] = Some(value(&mut iter)?),
+            "--hue" => settings.controls[3] = Some(value(&mut iter)?),
+            _ => "x".parse::<u8>().map(|_| ())?,
+        }
+    }
+    Ok(settings)
 }
 
 fn main() -> ExitCode {
@@ -565,6 +698,7 @@ fn main() -> ExitCode {
                 .map(|seconds| Operation::Signal(Some(seconds))),
             None => Ok(Operation::Signal(None)),
         },
+        Some("picture") => parse_picture(&arguments[1..]).map(Operation::Picture),
         Some("status") => Ok(Operation::Status),
         _ => Ok(Operation::Inspect),
     };
@@ -572,8 +706,9 @@ fn main() -> ExitCode {
         Ok(operation) => operation,
         Err(_) => {
             eprintln!(
-                "error: usage: hd60s-linux [status|signal|observe|observe-stream|capture] \
-                 [SECONDS] [--audio FILE] [--native]"
+                "error: usage: hd60s-linux [status|signal|picture|observe|observe-stream|capture] \\
+                 [SECONDS] [--audio FILE] [--native]\n       picture [--range standard|expanded] \\
+                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]"
             );
             return ExitCode::FAILURE;
         }
