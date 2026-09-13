@@ -339,7 +339,7 @@ fn handle(mut stream: TcpStream, shared: Arc<Shared>) {
             "application/json",
             state_json(&shared).as_bytes(),
         ),
-        ("POST", "/api/set") | ("GET", "/api/set") => match apply(&shared, &request) {
+        ("POST", "/api/set") => match apply(&shared, &request) {
             Ok(body) => respond(&mut stream, "200 OK", "application/json", body.as_bytes()),
             Err(error) => respond(
                 &mut stream,
@@ -348,7 +348,7 @@ fn handle(mut stream: TcpStream, shared: Arc<Shared>) {
                 format!("{{\"ok\":false,\"error\":{}}}", json_string(&error)).as_bytes(),
             ),
         },
-        ("POST", "/api/edid") | ("GET", "/api/edid") => {
+        ("POST", "/api/edid") => {
             let result = if request.get("restore").is_some() {
                 shared.request_edid_write(edid::FACTORY).map(|()| {
                     "power-on EDID scheduled; the stream restarts for a moment".to_string()
