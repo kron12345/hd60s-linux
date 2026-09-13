@@ -209,8 +209,20 @@ private (they contain the serial and captured video).
   is the mirror image: alternate setting 0, then register `0x10` := `00`. The
   official path is therefore isochronous; the bulk path (alternate setting 4)
   used by `capture` needs none of this and keeps working.
-- 1.5 s after the stream starts the application writes register `0x13` :=
-  `80 81 80 80` and 3 s later `80 80 80 80` again. Purpose unknown.
+- **Bank `0x64` registers written by the application** (traced by changing
+  each setting of the Game Capture HD application one at a time):
+  - `0x10`: stream on (`01`) / off (`00`). Every profile or frame-rate change
+    in the application is just a stop and a start of the stream.
+  - `0x12`: HDMI colour range, `00` = standard (limited), `01` = expanded
+    (full). The "Input Device" presets only set this: PC → `01`,
+    PlayStation 4 → `00`, the Xbox presets leave it alone.
+  - `0x13`: four picture controls, one byte each — brightness, contrast,
+    saturation, hue — with `80` as neutral. "Brightness up" wrote
+    `86 80 80 80`, "Reset Defaults" `80 80 80 80`. The `80 81 80 80` written
+    1.5 s after every stream start and reverted 3 s later is a brief +1
+    contrast nudge, presumably to make the receiver re-apply the controls.
+  - The application never rewrites the EDID for any setting; it does not
+    force an input resolution on the source.
 - Before starting, the application reads the **EDID from bank `0xa0`**
   (256 bytes as 16 reads of 16 bytes at `wIndex` 0, 16, … 240), writes it
   back, then writes a version with the monitor name changed from "Elgato" to
