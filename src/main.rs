@@ -4,8 +4,7 @@ use std::{fs::File, io::Write};
 
 use hd60s_linux::edid;
 use hd60s_linux::frame::{self, Assembler, Event};
-use hd60s_linux::pump::Input;
-use hd60s_linux::serve::serve;
+use hd60s_linux::serve::{Source, serve};
 use rusb::{
     Context, Device, DeviceDescriptor, Direction, Recipient, RequestType, TransferType, UsbContext,
 };
@@ -1021,7 +1020,6 @@ enum Operation {
     Audio(Option<u8>),
     Edid(EdidSettings),
     Mcu,
-    Serve { name: String },
     Status,
 }
 
@@ -1051,12 +1049,6 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
                 Operation::Audio(gain) => return audio(device, gain),
                 Operation::Edid(ref settings) => return edid_command(device, settings.clone()),
                 Operation::Mcu => return mcu(device),
-                Operation::Serve { ref name } => {
-                    let handle = device
-                        .open()
-                        .map_err(|error| format!("opening device: {error}"))?;
-                    return serve(name, Input::Usb(handle));
-                }
                 Operation::Status => return read_direct_startup_status(device),
                 Operation::Inspect => {}
             }
@@ -1164,14 +1156,6 @@ fn main() -> ExitCode {
             Ok(Operation::Edid(settings))
         }
         Some("mcu") => Ok(Operation::Mcu),
-        Some("serve") => Ok(Operation::Serve {
-            name: arguments
-                .iter()
-                .position(|argument| argument == "--name")
-                .and_then(|at| arguments.get(at + 1))
-                .cloned()
-                .unwrap_or_else(|| "Elgato HD60 S".to_string()),
-        }),
         Some("status") => Ok(Operation::Status),
         _ => Ok(Operation::Inspect),
     };
@@ -1183,19 +1167,23 @@ fn main() -> ExitCode {
                 .and_then(|at| arguments.get(at + 1))
                 .cloned()
         };
-        if let Some(path) = option("--from-file") {
-            let fps = option("--fps")
-                .and_then(|value| value.parse::<f64>().ok())
-                .unwrap_or(60.0);
-            let name = option("--name").unwrap_or_else(|| "Elgato HD60 S".to_string());
-            return match serve::<Context>(&name, Input::File { path, fps }) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    ExitCode::FAILURE
-                }
-            };
-        }
+        let name = option("--name").unwrap_or_else(|| "Elgato HD60 S".to_string());
+        let source = match option("--from-file") {
+            Some(path) => Source::File {
+                path,
+                fps: option("--fps")
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .unwrap_or(60.0),
+            },
+            None => Source::Usb,
+        };
+        return match serve(&name, source) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     let operation = match operation {
         Ok(operation) => operation,

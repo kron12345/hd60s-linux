@@ -15,10 +15,20 @@ use std::sync::{Arc, Mutex};
 use pipewire as pw;
 use pipewire_vircam::{Camera, Config, Format, Mode, State};
 use pw::{properties::properties, spa};
-use rusb::UsbContext;
+use rusb::Context;
 
+use crate::device;
 use crate::frame::{self, letterbox};
 use crate::pump::{self, Input};
+
+/// Where `serve` takes its stream from.
+pub enum Source {
+    /// The device on the USB bus; waited for when absent, picked up again
+    /// when it returns, so the camera and microphone nodes never go away.
+    Usb,
+    /// A recorded raw stream, replayed in a loop at `fps` frames per second.
+    File { path: String, fps: f64 },
+}
 
 const CANVAS_WIDTH: usize = frame::MAX_WIDTH;
 const CANVAS_HEIGHT: usize = frame::MAX_HEIGHT;
@@ -34,7 +44,7 @@ struct Shared {
 }
 
 /// Runs the camera and the audio source until the process is terminated.
-pub fn serve<T: UsbContext + 'static>(name: &str, input: Input<T>) -> Result<(), String> {
+pub fn serve(name: &str, source: Source) -> Result<(), String> {
     pw::init();
     let shared = Arc::new(Shared {
         latest: Mutex::new(None),
@@ -46,26 +56,80 @@ pub fn serve<T: UsbContext + 'static>(name: &str, input: Input<T>) -> Result<(),
     let pump_shared = shared.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let pump_stop = stop.clone();
-    let pump_thread = std::thread::spawn(move || {
-        let result = pump::run(
-            input,
-            pump_stop,
-            None,
-            |frame| {
-                let pixels = letterbox(frame, CANVAS_WIDTH, CANVAS_HEIGHT);
-                *pump_shared.latest.lock().unwrap() = Some(pixels);
-            },
-            |bytes| {
-                let mut ring = pump_shared.audio.lock().unwrap();
-                ring.extend(bytes);
-                if ring.len() > AUDIO_RING_BYTES {
-                    let excess = ring.len() - AUDIO_RING_BYTES;
-                    ring.drain(..excess);
+    let pump_thread = std::thread::spawn(move || -> Result<(), String> {
+        let on_frame = |shared: &Shared, frame: frame::Frame| {
+            let pixels = letterbox(frame, CANVAS_WIDTH, CANVAS_HEIGHT);
+            *shared.latest.lock().unwrap() = Some(pixels);
+        };
+        let on_audio = |shared: &Shared, bytes: Vec<u8>| {
+            let mut ring = shared.audio.lock().unwrap();
+            ring.extend(bytes);
+            if ring.len() > AUDIO_RING_BYTES {
+                let excess = ring.len() - AUDIO_RING_BYTES;
+                ring.drain(..excess);
+            }
+        };
+        match source {
+            Source::File { path, fps } => {
+                let result = pump::run(
+                    Input::<Context>::File { path, fps },
+                    pump_stop,
+                    None,
+                    |frame| on_frame(&pump_shared, frame),
+                    |bytes| on_audio(&pump_shared, bytes),
+                );
+                pump_shared.stop.store(true, Ordering::Relaxed);
+                result.map(|_| ())
+            }
+            Source::Usb => {
+                let context =
+                    Context::new().map_err(|error| format!("initializing libusb: {error}"))?;
+                let mut announced_missing = false;
+                while !pump_stop.load(Ordering::Relaxed) {
+                    let Some(device) = device::find(&context) else {
+                        if !announced_missing {
+                            eprintln!(
+                                "no HD60 S on the bus; waiting for one (looking for {})",
+                                device::known_ids()
+                            );
+                            announced_missing = true;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        continue;
+                    };
+                    announced_missing = false;
+                    let handle = match device.open() {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            eprintln!("opening the HD60 S: {error}; retrying");
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            continue;
+                        }
+                    };
+                    eprintln!("HD60 S found; streaming");
+                    let run_stop = Arc::new(AtomicBool::new(false));
+                    let result = pump::run(
+                        Input::Usb(handle),
+                        run_stop,
+                        None,
+                        |frame| on_frame(&pump_shared, frame),
+                        |bytes| on_audio(&pump_shared, bytes),
+                    );
+                    // Gone (unplugged, reset, or claimed elsewhere): show black,
+                    // keep the nodes, and wait for it to come back.
+                    *pump_shared.latest.lock().unwrap() = None;
+                    pump_shared.audio.lock().unwrap().clear();
+                    match result {
+                        Ok(stats) => {
+                            eprintln!("HD60 S stream ended after {} frame(s)", stats.frames)
+                        }
+                        Err(error) => eprintln!("HD60 S stream ended: {error}"),
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
                 }
-            },
-        );
-        pump_shared.stop.store(true, Ordering::Relaxed);
-        result
+                Ok(())
+            }
+        }
     });
 
     // Audio source on its own PipeWire main loop.
@@ -144,11 +208,8 @@ pub fn serve<T: UsbContext + 'static>(name: &str, input: Input<T>) -> Result<(),
         Ok(Ok(())) => {}
     }
     result.map_err(|error| format!("running the PipeWire camera: {error}"))?;
-    let stats = pump_result?;
-    eprintln!(
-        "stopped: {} frame(s), {} bad, {} audio block(s), {} format change(s)",
-        stats.frames, stats.bad_frames, stats.audio_blocks, stats.format_changes
-    );
+    pump_result?;
+    eprintln!("stopped");
     Ok(())
 }
 

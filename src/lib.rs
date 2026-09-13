@@ -1,3 +1,4 @@
+pub mod device;
 pub mod edid;
 pub mod frame;
 pub mod pump;
