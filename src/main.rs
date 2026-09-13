@@ -518,13 +518,13 @@ fn observe_iso<T: UsbContext>(context: &T, device: Device<T>, seconds: u64) -> R
         let started = Instant::now();
         let mut reported = Instant::now();
         while started.elapsed() < Duration::from_secs(seconds) {
-            let mut tv = libc::timeval {
+            let tv = libc::timeval {
                 tv_sec: 0,
                 tv_usec: 100_000,
             };
             libusb1_sys::libusb_handle_events_timeout_completed(
                 context.as_raw(),
-                &mut tv,
+                &tv,
                 std::ptr::null_mut(),
             );
             if reported.elapsed() >= Duration::from_secs(2) {
@@ -540,13 +540,13 @@ fn observe_iso<T: UsbContext>(context: &T, device: Device<T>, seconds: u64) -> R
             libusb1_sys::libusb_cancel_transfer(*transfer);
         }
         for _ in 0..10 {
-            let mut tv = libc::timeval {
+            let tv = libc::timeval {
                 tv_sec: 0,
                 tv_usec: 100_000,
             };
             libusb1_sys::libusb_handle_events_timeout_completed(
                 context.as_raw(),
-                &mut tv,
+                &tv,
                 std::ptr::null_mut(),
             );
         }
