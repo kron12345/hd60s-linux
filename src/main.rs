@@ -1135,6 +1135,7 @@ fn main() -> ExitCode {
         let stream_scale = option("--stream-scale")
             .and_then(|v| v.parse().ok())
             .unwrap_or(2);
+        let stream_token = option("--stream-token");
         return match serve(
             &name,
             source,
@@ -1147,6 +1148,7 @@ fn main() -> ExitCode {
                 stream_on,
                 stream_fps,
                 stream_scale,
+                stream_token,
             },
         ) {
             Ok(()) => ExitCode::SUCCESS,
@@ -1162,7 +1164,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "error: usage: hd60s-linux [status|signal|picture|audio|edid|mcu|report|serve|observe|observe-stream|observe-iso|capture] \\
                  [SECONDS] [--audio FILE] [--native]\n       picture [--range bypass|shrink|expand] \\
-                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]\n       serve [--name NAME] [--panel ADDR|off] [--tray off] [--record-dir DIR] [--record-encoder auto|x264|vaapi] [--stream on|off] [--stream-bind ADDR|off] [--stream-fps N] [--stream-scale N] [--from-file RAW [--fps N]]\n       report [--show-serial] [--no-capture]"
+                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]\n       serve [--name NAME] [--panel ADDR|off] [--tray off] [--record-dir DIR] [--record-encoder auto|x264|vaapi] [--stream on|off] [--stream-bind ADDR|off] [--stream-fps N] [--stream-scale N] [--stream-token T] [--from-file RAW [--fps N]]\n       report [--show-serial] [--no-capture]"
             );
             return ExitCode::FAILURE;
         }

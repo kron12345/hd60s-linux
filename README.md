@@ -87,6 +87,22 @@ everything the card exposes and lets you change what can be changed:
 The same is available as JSON under `/api/state`, `/api/set?brightness=…`
 and friends, `/preview.jpg`, `/edid.bin` and `/api/report`, for scripts.
 
+Reading is open to anything on this machine; **every change needs a
+token** that is new at each start, embedded in the page and written to
+`$XDG_RUNTIME_DIR/hd60s-linux/token` (mode 0600) for scripts:
+
+```bash
+curl -X POST -H "X-Token: $(cat "$XDG_RUNTIME_DIR/hd60s-linux/token")" \
+  "http://127.0.0.1:8060/api/record?start=1"
+```
+
+A web page you happen to visit cannot use the panel: it does not know the
+token, the custom header forces a CORS preflight the panel refuses, a
+foreign `Origin` is rejected, and a `Host` other than localhost (DNS
+rebinding) is rejected too. What remains is that other user accounts on
+the same machine can read the state; a Unix-socket API is the planned
+answer for that.
+
 **Only one process may talk to the card at a time.** The command-line tools
 refuse to touch the registers while `serve` holds the streaming interface —
 use the panel, or stop the service first. Every open runs the official
@@ -114,8 +130,9 @@ Off by default. Switched on from the panel or the tray, `serve` also serves
 the picture as Motion JPEG on **port 8061 on all interfaces**:
 `http://<host>:8061/stream.mjpg` (default 15 fps at 960x540; `?fps=30`,
 `?scale=1` for full size, `?quality=90`), `http://<host>:8061/snapshot.jpg`
-and a bare viewer page at `/`. There is no authentication — use it on a
-trusted network only. `--stream on` starts with it switched on,
+and a bare viewer page at `/`. It has no login by itself; `--stream-token SECRET` makes
+every URL require `?token=SECRET`, otherwise use it on a trusted network
+only. `--stream on` starts with it switched on,
 `--stream-bind ADDR` moves it, `--stream-bind off` removes it, and
 `--stream-fps N` / `--stream-scale N` change the defaults. Every client gets
 its own encoder thread (a 960x540 JPEG costs about 14 ms of one core).

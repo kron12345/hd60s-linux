@@ -74,6 +74,46 @@ pub struct Shared {
     pub stream_fps: u32,
     pub stream_scale: usize,
     pub stream_clients: std::sync::atomic::AtomicUsize,
+    /// Required in the URL of the network stream when set.
+    pub stream_token: Option<String>,
+    /// Required for every changing request to the panel; new at each start,
+    /// embedded in the page and written to `$XDG_RUNTIME_DIR/hd60s-linux/token`.
+    pub panel_token: String,
+    pub panel_bind: Option<String>,
+}
+
+fn random_token() -> String {
+    use std::io::Read;
+    let mut bytes = [0_u8; 16];
+    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b ^= (nanos >> (8 * (i % 16))) as u8 ^ (std::process::id() >> (8 * (i % 4))) as u8;
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Leaves the token where scripts of the same user can read it.
+fn publish_token(token: &str) {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(runtime).join("hd60s-linux");
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dir.join("token"))
+    {
+        use std::io::Write;
+        let _ = file.write_all(token.as_bytes());
+    }
 }
 
 impl Shared {
@@ -197,6 +237,7 @@ pub struct Options {
     pub stream_on: bool,
     pub stream_fps: u32,
     pub stream_scale: usize,
+    pub stream_token: Option<String>,
 }
 
 pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String> {
@@ -209,7 +250,10 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
         stream_on,
         stream_fps,
         stream_scale,
+        stream_token,
     } = options;
+    let panel_token = random_token();
+    publish_token(&panel_token);
     pw::init();
     let shared = Arc::new(Shared {
         latest: Mutex::new(None),
@@ -234,6 +278,9 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
         stream_fps,
         stream_scale,
         stream_clients: std::sync::atomic::AtomicUsize::new(0),
+        stream_token,
+        panel_token,
+        panel_bind: panel.clone(),
     });
     if let Some(address) = stream_bind {
         let stream_shared = shared.clone();

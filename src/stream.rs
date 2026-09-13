@@ -50,6 +50,17 @@ fn handle(mut stream: TcpStream, shared: Arc<Shared>) {
         );
         return;
     }
+    if let Some(token) = &shared.stream_token
+        && request.get("token") != Some(token.as_str())
+    {
+        respond(
+            &mut stream,
+            "403 Forbidden",
+            "text/plain",
+            b"add ?token=... to the URL",
+        );
+        return;
+    }
     let scale = request
         .number("scale")
         .map(usize::from)

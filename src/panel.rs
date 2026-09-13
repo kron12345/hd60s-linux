@@ -39,9 +39,35 @@ pub(crate) struct Request {
     pub method: String,
     pub path: String,
     query: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
 }
 
 impl Request {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Whether the request may change anything: it must carry the token
+    /// (header `X-Token` or query `token`), and if a browser sent an
+    /// `Origin`, that origin must be this server itself.
+    pub fn authorised(&self, token: &str) -> bool {
+        let presented = self
+            .header("x-token")
+            .or_else(|| self.get("token"))
+            .unwrap_or("");
+        if presented != token {
+            return false;
+        }
+        match (self.header("origin"), self.header("host")) {
+            (Some(origin), Some(host)) => origin == format!("http://{host}"),
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+    }
+
     pub fn get(&self, key: &str) -> Option<&str> {
         self.query
             .iter()
@@ -67,7 +93,13 @@ pub(crate) fn parse(stream: &mut TcpStream) -> Option<Request> {
         }
     }
     let text = String::from_utf8_lossy(&data);
-    let line = text.lines().next()?;
+    let mut lines = text.lines();
+    let line = lines.next()?;
+    let headers = lines
+        .take_while(|l| !l.is_empty())
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
     let mut parts = line.split_whitespace();
     let method = parts.next()?.to_string();
     let target = parts.next()?;
@@ -84,6 +116,7 @@ pub(crate) fn parse(stream: &mut TcpStream) -> Option<Request> {
         method,
         path: path.to_string(),
         query,
+        headers,
     })
 }
 
@@ -378,16 +411,51 @@ pub fn jpeg_from_yuyv(frame: &[u8], factor: usize, quality: u8) -> Option<Vec<u8
     Some(out)
 }
 
+/// The `Host` a browser may use to reach the panel: the bind address, or a
+/// loopback name with that port. Anything else is a DNS-rebinding attempt.
+pub(crate) fn host_allowed(request: &Request, bind: &str) -> bool {
+    let Some(host) = request.header("host") else {
+        return true;
+    };
+    if host == bind {
+        return true;
+    }
+    let port = bind.rsplit(':').next().unwrap_or("");
+    ["127.0.0.1", "localhost", "[::1]"]
+        .iter()
+        .any(|name| host == format!("{name}:{port}"))
+}
+
 fn handle(mut stream: TcpStream, shared: Arc<Shared>) {
     let Some(request) = parse(&mut stream) else {
         return;
     };
+    if let Some(bind) = &shared.panel_bind
+        && !host_allowed(&request, bind)
+    {
+        respond(
+            &mut stream,
+            "403 Forbidden",
+            "text/plain",
+            b"unexpected Host header",
+        );
+        return;
+    }
+    if request.method != "GET" && !request.authorised(&shared.panel_token) {
+        respond(
+            &mut stream,
+            "403 Forbidden",
+            "text/plain",
+            b"missing or wrong token: send it as X-Token or ?token=; scripts find it in $XDG_RUNTIME_DIR/hd60s-linux/token",
+        );
+        return;
+    }
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => respond(
             &mut stream,
             "200 OK",
             "text/html; charset=utf-8",
-            PAGE.as_bytes(),
+            PAGE.replace("__TOKEN__", &shared.panel_token).as_bytes(),
         ),
         ("GET", "/api/state") => respond(
             &mut stream,

@@ -87,10 +87,11 @@
 </div>
 <script>
 const $ = id => document.getElementById(id);
+const TOKEN = "__TOKEN__"; // per start; a custom header forces a CORS preflight that other origins fail
 const sliders = ["brightness","contrast","saturation","hue"];
 let dragging = null, lastMessage = null;
 function setMsg(t){ $("msg").textContent = t; }
-async function post(url){ const r = await fetch(url, {method:"POST"}); const j = await r.json(); if(!j.ok) setMsg("error: " + j.error); else setMsg("applied " + (j.changed||j.message||"")); return j; }
+async function post(url){ const r = await fetch(url, {method:"POST", headers:{"X-Token": TOKEN}}); const j = await r.json(); if(!j.ok) setMsg("error: " + j.error); else setMsg("applied " + (j.changed||j.message||"")); return j; }
 for (const id of sliders.concat(["gain"])) {
   const el = $(id), out = el.nextElementSibling;
   el.addEventListener("input", () => { dragging = id; out.textContent = id==="gain" ? ((el.value-128)*0.5).toFixed(1)+" dB" : el.value; });
