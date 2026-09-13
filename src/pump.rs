@@ -17,8 +17,9 @@ use crate::frame::{Assembler, Event, Frame, Stats};
 
 /// Where the raw stream comes from.
 pub enum Input<T: UsbContext> {
-    /// The device itself, already opened; interface 0 is claimed here.
-    Usb(DeviceHandle<T>),
+    /// The device itself, already opened; interface 0 is claimed here. The
+    /// handle is shared so the caller can keep using the control endpoint.
+    Usb(Arc<DeviceHandle<T>>),
     /// A recorded raw bulk stream, replayed in a loop at `fps` frames per second.
     File { path: String, fps: f64 },
 }
@@ -30,6 +31,19 @@ pub fn run<T: UsbContext + 'static>(
     input: Input<T>,
     stop: Arc<AtomicBool>,
     seconds: Option<u64>,
+    on_frame: impl FnMut(Frame),
+    on_audio: impl FnMut(Vec<u8>),
+) -> Result<Stats, String> {
+    run_with_stats(input, stop, seconds, None, on_frame, on_audio)
+}
+
+/// Like `run`, and additionally copies the running statistics into `live`
+/// after every chunk, for a panel or a log to read while streaming.
+pub fn run_with_stats<T: UsbContext + 'static>(
+    input: Input<T>,
+    stop: Arc<AtomicBool>,
+    seconds: Option<u64>,
+    live: Option<Arc<std::sync::Mutex<Stats>>>,
     mut on_frame: impl FnMut(Frame),
     mut on_audio: impl FnMut(Vec<u8>),
 ) -> Result<Stats, String> {
@@ -41,7 +55,7 @@ pub fn run<T: UsbContext + 'static>(
         Input::Usb(_) => 0.0,
     };
 
-    let reader = match input {
+    let (reader, usb_handle) = match input {
         Input::Usb(handle) => {
             let _ = handle.set_auto_detach_kernel_driver(true);
             handle
@@ -50,7 +64,9 @@ pub fn run<T: UsbContext + 'static>(
             handle
                 .set_alternate_setting(0, 4)
                 .map_err(|error| format!("selecting interface 0 alternate setting 4: {error}"))?;
-            std::thread::spawn(move || -> Result<(), String> {
+            let reader_handle = handle.clone();
+            let reader = std::thread::spawn(move || -> Result<(), String> {
+                let handle = reader_handle;
                 let timeout = Duration::from_millis(200);
                 let mut buffer = vec![0_u8; 1024 * 1024];
                 while !reader_stop.load(Ordering::Relaxed) {
@@ -65,14 +81,15 @@ pub fn run<T: UsbContext + 'static>(
                     }
                 }
                 Ok(())
-            })
+            });
+            (reader, Some(handle))
         }
         Input::File { path, .. } => {
             let data = std::fs::read(&path).map_err(|error| format!("reading {path}: {error}"))?;
             if data.is_empty() {
                 return Err(format!("{path} is empty"));
             }
-            std::thread::spawn(move || -> Result<(), String> {
+            let reader = std::thread::spawn(move || -> Result<(), String> {
                 let mut at = 0;
                 while !reader_stop.load(Ordering::Relaxed) {
                     let end = (at + (1 << 20)).min(data.len());
@@ -82,7 +99,8 @@ pub fn run<T: UsbContext + 'static>(
                     at = if end == data.len() { 0 } else { end };
                 }
                 Ok(())
-            })
+            });
+            (reader, None)
         }
     };
 
@@ -108,6 +126,9 @@ pub fn run<T: UsbContext + 'static>(
                     Event::Audio(bytes) => on_audio(bytes),
                 });
                 frames_emitted += emitted;
+                if let Some(live) = &live {
+                    *live.lock().unwrap() = assembler.stats;
+                }
                 if paced && emitted > 0 {
                     // Hold the replay to real time: frame N is due at N / fps.
                     let due = Duration::from_secs_f64(frames_emitted as f64 / fps);
@@ -123,7 +144,12 @@ pub fn run<T: UsbContext + 'static>(
 
     stop.store(true, Ordering::Relaxed);
     drop(receiver);
-    if let Ok(Err(error)) = reader.join() {
+    let outcome = reader.join();
+    // Hand the interface back so the same handle can stream again later.
+    if let Some(handle) = usb_handle {
+        let _ = handle.release_interface(0);
+    }
+    if let Ok(Err(error)) = outcome {
         return Err(error);
     }
     Ok(assembler.stats)

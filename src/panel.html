@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HD60 S</title>
+<style>
+  :root { color-scheme: dark; --bg:#14161a; --card:#1d2026; --line:#2c3038; --fg:#e6e6e6; --dim:#9aa0a8; --ok:#5ec27a; --warn:#e0a640; --bad:#e05a5a; --accent:#4aa3ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; padding:16px; }
+  h1 { font-size:18px; margin:0 0 12px; display:flex; align-items:center; gap:10px; }
+  h1 small { color:var(--dim); font-weight:normal; font-size:13px; }
+  .grid { display:grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap:14px; }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 10px; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--dim); }
+  .dot.ok { background:var(--ok); } .dot.warn { background:var(--warn); } .dot.bad { background:var(--bad); }
+  img#preview { width:100%; aspect-ratio:16/9; background:#000; border-radius:6px; display:block; }
+  .row { display:flex; align-items:center; gap:10px; margin:6px 0; }
+  .row label { width:92px; color:var(--dim); }
+  .row input[type=range] { flex:1; accent-color:var(--accent); }
+  .row output { width:44px; text-align:right; font-variant-numeric: tabular-nums; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 12px; }
+  .kv dt { color:var(--dim); } .kv dd { margin:0; font-variant-numeric: tabular-nums; word-break: break-word; }
+  button, select { background:#2a2f38; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 10px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  .buttons { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+  pre { background:#0f1114; border:1px solid var(--line); border-radius:6px; padding:10px; overflow:auto; max-height:260px; font-size:12px; }
+  #msg { color:var(--dim); min-height:1.4em; }
+  .mono { font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<h1><span class="dot" id="devdot"></span> Elgato HD60 S <small id="devtext">connecting…</small></h1>
+<div class="grid">
+  <div>
+    <div class="card">
+      <h2>Preview</h2>
+      <img id="preview" alt="preview">
+      <div class="kv" style="margin-top:10px">
+        <dt>Input</dt><dd id="timing">–</dd>
+        <dt>Stream</dt><dd id="stream">–</dd>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h2>Picture</h2>
+      <div class="row"><label for="brightness">Brightness</label><input type="range" id="brightness" min="0" max="255"><output for="brightness">128</output></div>
+      <div class="row"><label for="contrast">Contrast</label><input type="range" id="contrast" min="0" max="255"><output for="contrast">128</output></div>
+      <div class="row"><label for="saturation">Saturation</label><input type="range" id="saturation" min="0" max="255"><output for="saturation">128</output></div>
+      <div class="row"><label for="hue">Hue</label><input type="range" id="hue" min="0" max="255"><output for="hue">128</output></div>
+      <div class="row"><label for="range">Colour range</label>
+        <select id="range"><option value="0">bypass (default)</option><option value="1">shrink (the app calls this "expanded")</option><option value="2">expand</option></select>
+      </div>
+      <div class="row"><label for="gain">Audio gain</label><input type="range" id="gain" min="0" max="255"><output for="gain">0.0 dB</output></div>
+      <div class="buttons"><button id="reset">Reset all to neutral</button></div>
+      <div id="msg"></div>
+    </div>
+  </div>
+  <div>
+    <div class="card">
+      <h2>Device</h2>
+      <dl class="kv" id="device"></dl>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h2>EDID (what the source is told)</h2>
+      <div id="edid">–</div>
+      <div class="buttons">
+        <a href="/edid.bin" download="hd60s-edid.bin"><button type="button">Download current</button></a>
+        <button id="edidrestore">Restore power-on EDID</button>
+      </div>
+      <div style="color:var(--dim);margin-top:6px">Writing stops the stream for a moment; the source re-reads the EDID on its next HDMI hot-plug.</div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h2>Microcontroller</h2>
+      <dl class="kv" id="mcu"></dl>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h2>Report</h2>
+      <div class="buttons"><button id="reportbtn">Generate report for an issue</button></div>
+      <pre id="report" hidden></pre>
+    </div>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const sliders = ["brightness","contrast","saturation","hue"];
+let dragging = null, lastMessage = null;
+function setMsg(t){ $("msg").textContent = t; }
+async function post(url){ const r = await fetch(url, {method:"POST"}); const j = await r.json(); if(!j.ok) setMsg("error: " + j.error); else setMsg("applied " + (j.changed||j.message||"")); return j; }
+for (const id of sliders.concat(["gain"])) {
+  const el = $(id), out = el.nextElementSibling;
+  el.addEventListener("input", () => { dragging = id; out.textContent = id==="gain" ? ((el.value-128)*0.5).toFixed(1)+" dB" : el.value; });
+  el.addEventListener("change", async () => { await post(`/api/set?${id}=${el.value}`); dragging = null; });
+}
+$("range").addEventListener("change", () => post(`/api/set?range=${$("range").value}`));
+$("reset").addEventListener("click", () => post(`/api/set?reset=1`));
+$("edidrestore").addEventListener("click", () => post(`/api/edid?restore=1`));
+$("reportbtn").addEventListener("click", async () => { const t = await (await fetch("/api/report")).text(); $("report").textContent = t; $("report").hidden = false; });
+function kv(el, pairs){ el.innerHTML = pairs.map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join(""); }
+async function refresh(){
+  try {
+    const s = await (await fetch("/api/state")).json();
+    const dev = s.device || {};
+    $("devdot").className = "dot " + (dev.present ? (s.timing && s.timing.present ? "ok" : "warn") : "bad");
+    $("devtext").textContent = dev.present ? `${dev.revision} · firmware ${dev.firmware} · MCU build ${dev.mcu_build} · ${dev.speed}` : (dev.error || "no device");
+    $("timing").textContent = s.timing ? (s.timing.text || s.timing.error) : "–";
+    const st = s.stream || {};
+    $("stream").textContent = `${st.present ? "streaming" : "waiting for the card"} · ${st.fps} fps · ${st.frames} frames · ${st.bad} bad · ${st.format_changes} format change(s) · source ${st.geometry[0]}x${st.geometry[1]} · up ${Math.round(st.uptime/60)} min`;
+    if (dev.present) {
+      kv($("device"), [["Revision", dev.revision],["Product ID", dev.product_id],["Firmware", dev.firmware],["MCU build", dev.mcu_build],["USB", `${dev.speed}, bus ${dev.bus} address ${dev.address}`]]);
+      if (s.settings && !s.settings.error) {
+        sliders.forEach((id,i) => { if (dragging !== id) { $(id).value = s.settings.picture[i]; $(id).nextElementSibling.textContent = s.settings.picture[i]; } });
+        if (dragging !== "gain") { $("gain").value = s.settings.gain; $("gain").nextElementSibling.textContent = s.settings.gain_db.toFixed(1) + " dB"; }
+        if (document.activeElement !== $("range")) $("range").value = s.settings.range;
+      }
+    } else {
+      kv($("device"), [["Status", dev.error || "not found"]]);
+    }
+    if (s.edid) $("edid").textContent = s.edid.error || `${s.edid.summary} — ${s.edid.valid ? "valid" : "INVALID"}${s.edid.factory ? ", power-on block" : ", custom"}`;
+    if (s.mcu) kv($("mcu"), s.mcu.map(m => [`${m.command} ${m.meaning}`, `<span class="mono">${m.reply}</span>`]).concat([["read", `${s.snapshot_age} s ago, before the stream started`]]));
+    if (s.message && s.message !== lastMessage) { lastMessage = s.message; setMsg(s.message); }
+  } catch (e) { $("devtext").textContent = "panel unreachable"; $("devdot").className = "dot bad"; }
+}
+function refreshPreview(){ const img = $("preview"); const next = new Image(); next.onload = () => { img.src = next.src; }; next.src = "/preview.jpg?t=" + Date.now(); }
+refresh(); setInterval(refresh, 1500); refreshPreview(); setInterval(refreshPreview, 400);
+</script>
+</body>
+</html>

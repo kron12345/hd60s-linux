@@ -2,6 +2,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use std::{fs::File, io::Write};
 
+use hd60s_linux::device::{known_ids, revision as hd60s_revision};
 use hd60s_linux::edid;
 use hd60s_linux::frame::{self, Assembler, Event};
 use hd60s_linux::serve::{Source, serve};
@@ -9,26 +10,6 @@ use rusb::{
     Context, Device, DeviceDescriptor, Direction, Recipient, RequestType, TransferType, UsbContext,
 };
 
-const ELGATO_VENDOR_ID: u16 = 0x0fd9;
-/// Product IDs from the official Windows driver's INF, which maps all four
-/// hardware revisions onto the same driver.
-const HD60S_PRODUCT_IDS: [(u16, &str); 4] = [
-    (0x004f, "HD60 S"),
-    (0x005e, "HD60 S Rev. 2"),
-    (0x0074, "HD60 S Rev. 3"),
-    (0x0076, "HD60 S Rev. 4"),
-];
-
-/// Returns the INF revision name when the descriptor names a supported device.
-fn hd60s_revision(vendor_id: u16, product_id: u16) -> Option<&'static str> {
-    if vendor_id != ELGATO_VENDOR_ID {
-        return None;
-    }
-    HD60S_PRODUCT_IDS
-        .iter()
-        .find(|(id, _)| *id == product_id)
-        .map(|(_, name)| *name)
-}
 const REGISTER_REQUEST: u8 = 0xc0;
 const HDMI_REGISTER_BANK: u16 = 0x0098;
 const STARTUP_STATUS_REGISTER: u16 = 0x003b;
@@ -1023,6 +1004,27 @@ enum Operation {
     Status,
 }
 
+/// Holds the streaming interface while registers are used from this
+/// process, so that no other process streams meanwhile: control transfers
+/// next to a stream owned by a different handle have hung the card's
+/// microcontroller until the next power cycle.
+fn exclusive<T: UsbContext>(device: &Device<T>) -> Result<rusb::DeviceHandle<T>, String> {
+    let handle = device
+        .open()
+        .map_err(|error| format!("opening device: {error}"))?;
+    let _ = handle.set_auto_detach_kernel_driver(true);
+    match handle.claim_interface(0) {
+        Ok(()) => Ok(handle),
+        Err(rusb::Error::Busy) => Err(
+            "the HD60 S is streaming in another process (hd60s-linux serve?); \
+             talking to its registers from here could hang the card — use the control panel at \
+             http://127.0.0.1:8060/ or stop the service first"
+                .into(),
+        ),
+        Err(error) => Err(format!("claiming interface 0: {error}")),
+    }
+}
+
 fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
     let context = Context::new().map_err(|error| format!("initializing libusb: {error}"))?;
     let devices = context
@@ -1044,11 +1046,26 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
                 Operation::Capture(seconds, ref audio, native) => {
                     return capture(device, seconds, audio.as_deref(), native);
                 }
-                Operation::Signal(seconds) => return read_signal(device, seconds),
-                Operation::Picture(ref settings) => return picture(device, settings.clone()),
-                Operation::Audio(gain) => return audio(device, gain),
-                Operation::Edid(ref settings) => return edid_command(device, settings.clone()),
-                Operation::Mcu => return mcu(device),
+                Operation::Signal(seconds) => {
+                    let _claim = exclusive(&device)?;
+                    return read_signal(device, seconds);
+                }
+                Operation::Picture(ref settings) => {
+                    let _claim = exclusive(&device)?;
+                    return picture(device, settings.clone());
+                }
+                Operation::Audio(gain) => {
+                    let _claim = exclusive(&device)?;
+                    return audio(device, gain);
+                }
+                Operation::Edid(ref settings) => {
+                    let _claim = exclusive(&device)?;
+                    return edid_command(device, settings.clone());
+                }
+                Operation::Mcu => {
+                    let _claim = exclusive(&device)?;
+                    return mcu(device);
+                }
                 Operation::Status => return read_direct_startup_status(device),
                 Operation::Inspect => {}
             }
@@ -1057,12 +1074,7 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
         }
     }
 
-    let known = HD60S_PRODUCT_IDS
-        .iter()
-        .map(|(id, name)| format!("{ELGATO_VENDOR_ID:04x}:{id:04x} ({name})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(format!("no HD60 S found; looked for {known}"))
+    Err(format!("no HD60 S found; looked for {}", known_ids()))
 }
 
 /// Parses `picture` options; values are 0..=255 with 128 as neutral.
@@ -1159,6 +1171,15 @@ fn main() -> ExitCode {
         Some("status") => Ok(Operation::Status),
         _ => Ok(Operation::Inspect),
     };
+    if arguments.first().map(String::as_str) == Some("report") {
+        let capture = if arguments.iter().any(|a| a == "--no-capture") {
+            0
+        } else {
+            3
+        };
+        print!("{}", hd60s_linux::report::text(show_serial, capture));
+        return ExitCode::SUCCESS;
+    }
     if arguments.first().map(String::as_str) == Some("serve") {
         let option = |flag: &str| {
             arguments
@@ -1177,7 +1198,12 @@ fn main() -> ExitCode {
             },
             None => Source::Usb,
         };
-        return match serve(&name, source) {
+        let panel = match option("--panel").as_deref() {
+            Some("off") | Some("none") => None,
+            Some(address) => Some(address.to_string()),
+            None => Some("127.0.0.1:8060".to_string()),
+        };
+        return match serve(&name, source, panel) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("error: {error}");
@@ -1189,9 +1215,9 @@ fn main() -> ExitCode {
         Ok(operation) => operation,
         Err(_) => {
             eprintln!(
-                "error: usage: hd60s-linux [status|signal|picture|audio|edid|mcu|serve|observe|observe-stream|observe-iso|capture] \\
+                "error: usage: hd60s-linux [status|signal|picture|audio|edid|mcu|report|serve|observe|observe-stream|observe-iso|capture] \\
                  [SECONDS] [--audio FILE] [--native]\n       picture [--range bypass|shrink|expand] \\
-                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]\n       serve [--name NAME] [--from-file RAW [--fps N]]"
+                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]\n       serve [--name NAME] [--panel ADDR|off] [--from-file RAW [--fps N]]\n       report [--show-serial] [--no-capture]"
             );
             return ExitCode::FAILURE;
         }

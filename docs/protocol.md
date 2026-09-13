@@ -283,6 +283,38 @@ the command is avoided on the assumption that the entry point is shared.)
 
 There is no USB command for the light strip; see the note on it above.
 
+### Register access while streaming (measured 2026-09-13)
+
+The official driver keeps using the control endpoint while it streams: it
+polls bank `0x64` register `0x00` every 105 ms and writes the picture
+registers when the user moves a slider, all through the same device handle
+that owns the bulk pipe. Doing something similar from Linux with a *second*
+handle went wrong: while `serve` streamed on alternate setting 4, another
+process opened the device and issued an MCU proxy command (`0x5066`, write
+then read). The write went through, the read timed out, and from then on
+every vendor request — bank `0x64`, the EDID bank `0xa0` and the proxy —
+timed out or failed with an I/O error, even after the stream was stopped.
+A libusb device reset, the sysfs `authorized` toggle and a hub port
+`disable`/enable (which cut the SuperSpeed link but not VBUS on this root
+hub) did not help; the card came back at High Speed on the USB 2 pair once.
+Unbinding and rebinding the xHCI controller restored the SuperSpeed link
+and bank `0x64` reads, but selecting alternate setting 4 failed ("Other
+error") and the proxy stayed dead: the microcontroller had hung and only a
+physical replug (power cycle) recovers it. Whether the MCU proxy during
+streaming or any vendor request from a second handle is the trigger was not
+separated; both are avoided. The tools now:
+
+- use one handle per process for streaming *and* register access
+  (`serve` and its panel share the handle, like the official driver);
+- refuse register access from the command line while another process holds
+  the streaming interface (claiming interface 0 detects that);
+- read the microcontroller and the EDID only before streaming; a panel EDID
+  write stops the stream, writes, and reattaches.
+
+Bank `0x64` reads and writes through the streaming handle while data flows
+are what the official driver does; they are the only register traffic the
+panel makes during a stream.
+
 A complete kernel driver for all four revisions exists in
 [dougg3/hd60s-linux-driver](https://github.com/dougg3/hd60s-linux-driver)
 (V4L2 + ALSA, interlaced input, picture controls). For end users that is the
@@ -378,3 +410,5 @@ size across source changes; `capture --native` writes frames at source size.
 - Meaning of interrupt endpoint `0x81`, which stayed silent even under the
   official driver and application.
 - Whether Rev. 1 to 3 stream without initialization as well.
+- Which request exactly hangs the microcontroller when issued next to a
+  stream from another handle (see above); until known, none is sent.

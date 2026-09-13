@@ -61,6 +61,47 @@ instance: a second one finds the interface busy and just keeps waiting.
 the node names; `--from-file RAW [--fps N]` replays a recorded raw stream
 instead of the device, for development without hardware.
 
+### Control panel
+
+While `serve` runs it also serves a control panel on
+<http://127.0.0.1:8060/> (`--panel ADDR` moves it, `--panel off` disables
+it; it is bound to localhost and has no authentication). The page shows
+everything the card exposes and lets you change what can be changed:
+
+- a live preview of the captured picture, the detected input timing and the
+  stream statistics (frames, frame rate, bad frames, format changes);
+- brightness, contrast, saturation, hue, the colour range and the audio
+  gain — applied to the card as you move the sliders;
+- the device identity (revision, USB speed, firmware version, MCU build
+  date), the microcontroller status replies, the EDID (download it or go
+  back to the power-on block; writing pauses the stream for a moment) and a
+  report for bug reports.
+
+The same is available as JSON under `/api/state`, `/api/set?brightness=…`
+and friends, `/preview.jpg`, `/edid.bin` and `/api/report`, for scripts.
+
+**Only one process may talk to the card at a time.** Register access from a
+second handle while another process streams has hung the card's
+microcontroller until the next power cycle (unplug and plug back; a USB
+reset is not enough). The command-line tools therefore refuse to touch the
+registers while `serve` holds the streaming interface — use the panel, or
+stop the service first — and `serve` itself reads the microcontroller and
+the EDID only before it starts streaming, as the official driver does.
+
+### Diagnostics
+
+```bash
+hd60s-linux report                # paste into an issue
+hd60s-linux report --show-serial  # include the card's serial number
+hd60s-linux report --no-capture   # skip the 3-second test capture
+```
+
+prints the tool and system versions, the device identity, the MCU status,
+the EDID, the detected input and the settings, then streams for three
+seconds and reports frame rate and errors. The panel's report button gives
+the same while `serve` is running (with the live stream statistics instead
+of a test capture).
+
 ## Capturing (Rev. 4)
 
 Frames are written raw to stdout as YUYV 4:2:2. Whatever the source sends

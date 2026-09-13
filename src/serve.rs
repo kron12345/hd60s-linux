@@ -17,6 +17,7 @@ use pipewire_vircam::{Camera, Config, Format, Mode, State};
 use pw::{properties::properties, spa};
 use rusb::Context;
 
+use crate::control::{Control, Snapshot};
 use crate::device;
 use crate::frame::{self, letterbox};
 use crate::pump::{self, Input};
@@ -37,20 +38,89 @@ const AUDIO_CHANNELS: u32 = 2;
 /// One second of audio; anything older is dropped rather than delaying the picture.
 const AUDIO_RING_BYTES: usize = (AUDIO_RATE * AUDIO_CHANNELS * 2) as usize;
 
-struct Shared {
-    latest: Mutex<Option<Vec<u8>>>,
-    audio: Mutex<VecDeque<u8>>,
-    stop: AtomicBool,
+/// State shared between the pump, the PipeWire threads and the panel.
+pub struct Shared {
+    pub latest: Mutex<Option<Vec<u8>>>,
+    pub audio: Mutex<VecDeque<u8>>,
+    pub stop: AtomicBool,
+    pub stats: Arc<Mutex<frame::Stats>>,
+    /// Width and height of the source before letterboxing.
+    pub geometry: Mutex<(usize, usize)>,
+    pub device_present: AtomicBool,
+    pub started: std::time::Instant,
+    /// (frames, seconds) samples for a recent frame rate.
+    fps_window: Mutex<VecDeque<(u64, f64)>>,
+    /// Register access through the streaming handle while the device is
+    /// attached; `None` in between.
+    pub control: Mutex<Option<Control>>,
+    /// Microcontroller and EDID state read before the stream started.
+    pub snapshot: Mutex<Option<Snapshot>>,
+    /// An EDID to write once the stream has been stopped for it.
+    pending_edid: Mutex<Option<[u8; 256]>>,
+    /// Stops the current stream run (the pump reattaches a second later).
+    run_stop: Mutex<Option<Arc<AtomicBool>>>,
+    /// Outcome of the last deferred job, for the panel.
+    pub message: Mutex<Option<String>>,
+}
+
+impl Shared {
+    /// Schedules an EDID write. The EEPROM sits behind the microcontroller,
+    /// which must not be talked to while streaming, so the stream is stopped,
+    /// the block written, and the device picked up again.
+    pub fn request_edid_write(&self, block: [u8; 256]) -> Result<(), String> {
+        crate::edid::validate(&block)?;
+        if self.control.lock().unwrap().is_none() {
+            return Err("no HD60 S attached".into());
+        }
+        *self.pending_edid.lock().unwrap() = Some(block);
+        if let Some(stop) = self.run_stop.lock().unwrap().as_ref() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Frames per second over roughly the last five seconds.
+    pub fn recent_fps(&self) -> f64 {
+        let now = self.started.elapsed().as_secs_f64();
+        let frames = self.stats.lock().unwrap().frames;
+        let mut window = self.fps_window.lock().unwrap();
+        window.push_back((frames, now));
+        while window.len() > 1 && now - window.front().unwrap().1 > 5.0 {
+            window.pop_front();
+        }
+        match (window.front(), window.back()) {
+            (Some(a), Some(b)) if b.1 > a.1 => (b.0 - a.0) as f64 / (b.1 - a.1),
+            _ => 0.0,
+        }
+    }
 }
 
 /// Runs the camera and the audio source until the process is terminated.
-pub fn serve(name: &str, source: Source) -> Result<(), String> {
+pub fn serve(name: &str, source: Source, panel: Option<String>) -> Result<(), String> {
     pw::init();
     let shared = Arc::new(Shared {
         latest: Mutex::new(None),
         audio: Mutex::new(VecDeque::with_capacity(AUDIO_RING_BYTES)),
         stop: AtomicBool::new(false),
+        stats: Arc::new(Mutex::new(frame::Stats::default())),
+        geometry: Mutex::new((0, 0)),
+        device_present: AtomicBool::new(false),
+        started: std::time::Instant::now(),
+        fps_window: Mutex::new(VecDeque::new()),
+        control: Mutex::new(None),
+        snapshot: Mutex::new(None),
+        pending_edid: Mutex::new(None),
+        run_stop: Mutex::new(None),
+        message: Mutex::new(None),
     });
+    if let Some(address) = panel {
+        let panel_shared = shared.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = crate::panel::run(&address, panel_shared) {
+                eprintln!("panel: {error}");
+            }
+        });
+    }
 
     // Pump: device or file → shared state.
     let pump_shared = shared.clone();
@@ -58,6 +128,7 @@ pub fn serve(name: &str, source: Source) -> Result<(), String> {
     let pump_stop = stop.clone();
     let pump_thread = std::thread::spawn(move || -> Result<(), String> {
         let on_frame = |shared: &Shared, frame: frame::Frame| {
+            *shared.geometry.lock().unwrap() = (frame.width, frame.height);
             let pixels = letterbox(frame, CANVAS_WIDTH, CANVAS_HEIGHT);
             *shared.latest.lock().unwrap() = Some(pixels);
         };
@@ -71,10 +142,12 @@ pub fn serve(name: &str, source: Source) -> Result<(), String> {
         };
         match source {
             Source::File { path, fps } => {
-                let result = pump::run(
+                pump_shared.device_present.store(true, Ordering::Relaxed);
+                let result = pump::run_with_stats(
                     Input::<Context>::File { path, fps },
                     pump_stop,
                     None,
+                    Some(pump_shared.stats.clone()),
                     |frame| on_frame(&pump_shared, frame),
                     |bytes| on_audio(&pump_shared, bytes),
                 );
@@ -108,14 +181,37 @@ pub fn serve(name: &str, source: Source) -> Result<(), String> {
                             continue;
                         }
                     };
+                    let handle = Arc::new(handle);
+                    let control = match Control::from_handle(handle.clone(), &device) {
+                        Ok(control) => control,
+                        Err(error) => {
+                            eprintln!("HD60 S: {error}; retrying");
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            continue;
+                        }
+                    };
+                    // Microcontroller and EDID are read now, before the stream,
+                    // as the official driver does; never while data flows.
+                    let snapshot = Snapshot::take(&control);
                     if !quiet {
-                        eprintln!("HD60 S found; streaming");
+                        eprintln!(
+                            "HD60 S found (MCU firmware {}); streaming",
+                            snapshot
+                                .firmware_date
+                                .clone()
+                                .unwrap_or_else(|error| format!("unknown: {error}"))
+                        );
                     }
+                    *pump_shared.snapshot.lock().unwrap() = Some(snapshot);
+                    *pump_shared.control.lock().unwrap() = Some(control);
                     let run_stop = Arc::new(AtomicBool::new(false));
-                    let result = pump::run(
-                        Input::Usb(handle),
+                    *pump_shared.run_stop.lock().unwrap() = Some(run_stop.clone());
+                    pump_shared.device_present.store(true, Ordering::Relaxed);
+                    let result = pump::run_with_stats(
+                        Input::Usb(handle.clone()),
                         run_stop,
                         None,
+                        Some(pump_shared.stats.clone()),
                         |frame| on_frame(&pump_shared, frame),
                         |bytes| on_audio(&pump_shared, bytes),
                     );
@@ -123,6 +219,26 @@ pub fn serve(name: &str, source: Source) -> Result<(), String> {
                     // keep the nodes, and wait for it to come back.
                     *pump_shared.latest.lock().unwrap() = None;
                     pump_shared.audio.lock().unwrap().clear();
+                    pump_shared.device_present.store(false, Ordering::Relaxed);
+                    *pump_shared.geometry.lock().unwrap() = (0, 0);
+                    *pump_shared.run_stop.lock().unwrap() = None;
+                    // Deferred jobs that needed the stream stopped.
+                    let pending = pump_shared.pending_edid.lock().unwrap().take();
+                    if let Some(block) = pending {
+                        let control = pump_shared.control.lock().unwrap();
+                        let message = match control.as_ref().map(|c| c.write_edid(&block)) {
+                            Some(Ok(differing)) => format!(
+                                "EDID written ({differing} byte(s) adjusted by the device); the source re-reads it on the next HDMI hot-plug"
+                            ),
+                            Some(Err(error)) => format!("EDID write failed: {error}"),
+                            None => "EDID write skipped: device gone".to_string(),
+                        };
+                        eprintln!("{message}");
+                        *pump_shared.message.lock().unwrap() = Some(message);
+                        last_end = None; // announce the reattach
+                    }
+                    *pump_shared.control.lock().unwrap() = None;
+                    drop(handle);
                     // Report once per distinct outcome, not once per retry: another
                     // instance holding the interface would otherwise log every second.
                     let outcome = match &result {
