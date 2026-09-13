@@ -80,6 +80,14 @@ Wayland (Plasma, sway) and X11. It talks to the service over
 reach — no port, no token, nothing a browser can get at. The web panel
 below offers the same over HTTP for remote or scripted use.
 
+The program also decides how the service runs. Its *Service* box has
+**Start automatically in the background (systemd)**: ticked, the user unit
+is enabled — it starts when the card is plugged in and at login, and the
+tray icon is always there. Unticked, the unit is disabled and masked, and
+the program runs its own `hd60s-linux serve` for exactly as long as it is
+open; close it and the card is released. *Start/Stop service* does the
+same by hand.
+
 ### Control panel
 
 With `--panel on` (or `--panel ADDR`) `serve` also serves a web version of
