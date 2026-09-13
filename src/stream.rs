@@ -21,7 +21,7 @@ pub fn run(address: &str, shared: Arc<Shared>) -> Result<(), String> {
         .map_err(|error| format!("binding the network stream to {address}: {error}"))?;
     eprintln!(
         "network stream ready at http://{address}/stream.mjpg ({})",
-        if shared.network_stream.load(Ordering::Relaxed) {
+        if shared.network.enabled.load(Ordering::Relaxed) {
             "on"
         } else {
             "off until switched on"
@@ -42,7 +42,7 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>) {
     let Some(request) = parse(&mut stream) else {
         return;
     };
-    if !shared.network_stream.load(Ordering::Relaxed) {
+    if !shared.network.enabled.load(Ordering::Relaxed) {
         respond(
             &mut stream,
             "503 Service Unavailable",
@@ -51,7 +51,7 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>) {
         );
         return;
     }
-    if let Some(token) = &shared.stream_token
+    if let Some(token) = &shared.network.token
         && request.get("token") != Some(token.as_str())
     {
         respond(
@@ -65,7 +65,7 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>) {
     let scale = request
         .number("scale")
         .map(usize::from)
-        .unwrap_or(shared.stream_scale);
+        .unwrap_or(shared.network.scale);
     let quality = request.number("quality").unwrap_or(80);
     match request.path.as_str() {
         "/" => respond(
@@ -75,7 +75,7 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>) {
             PAGE.as_bytes(),
         ),
         "/snapshot.jpg" => {
-            let frame = shared.latest.lock().unwrap().clone();
+            let frame = shared.video.latest.lock().unwrap().clone();
             match frame.and_then(|f| jpeg_from_yuyv(&f, scale, quality)) {
                 Some(jpeg) => respond(&mut stream, "200 OK", "image/jpeg", &jpeg),
                 None => respond(&mut stream, "204 No Content", "text/plain", b""),
@@ -85,11 +85,11 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>) {
             let fps = request
                 .number("fps")
                 .map(u32::from)
-                .unwrap_or(shared.stream_fps)
+                .unwrap_or(shared.network.fps)
                 .clamp(1, 60);
-            shared.stream_clients.fetch_add(1, Ordering::Relaxed);
+            shared.network.clients.fetch_add(1, Ordering::Relaxed);
             mjpeg(&mut stream, &shared, scale, quality, fps);
-            shared.stream_clients.fetch_sub(1, Ordering::Relaxed);
+            shared.network.clients.fetch_sub(1, Ordering::Relaxed);
         }
         _ => respond(&mut stream, "404 Not Found", "text/plain", b"not found"),
     }
@@ -103,8 +103,8 @@ fn mjpeg<W: Write>(stream: &mut W, shared: &Shared, scale: usize, quality: u8, f
     let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
     let mut last: Option<Arc<Vec<u8>>> = None;
     let mut next = Instant::now();
-    while shared.network_stream.load(Ordering::Relaxed) && !shared.stop.load(Ordering::Relaxed) {
-        let frame = shared.latest.lock().unwrap().clone();
+    while shared.network.enabled.load(Ordering::Relaxed) && !shared.stop.load(Ordering::Relaxed) {
+        let frame = shared.video.latest.lock().unwrap().clone();
         let fresh = match (&frame, &last) {
             (Some(f), Some(l)) => !Arc::ptr_eq(f, l),
             (Some(_), None) => true,

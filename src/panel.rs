@@ -69,8 +69,8 @@ pub fn run_unix(path: &std::path::Path, shared: Arc<Shared>) -> Result<(), Strin
 /// Everything a client wants to know, read from the shared state and, for
 /// timing and settings, from the card through the streaming handle.
 pub fn state(shared: &Shared) -> State {
-    let stats = *shared.stats.lock().unwrap();
-    let geometry = *shared.geometry.lock().unwrap();
+    let stats = *shared.video.stats.lock().unwrap();
+    let geometry = *shared.video.geometry.lock().unwrap();
     let mut state = State {
         stream: hd60s_api::StreamStats {
             frames: stats.frames,
@@ -78,11 +78,11 @@ pub fn state(shared: &Shared) -> State {
             format_changes: stats.format_changes,
             audio_blocks: stats.audio_blocks,
             fps: shared.recent_fps(),
-            present: shared.device_present.load(Ordering::Relaxed),
+            present: shared.video.device_present.load(Ordering::Relaxed),
             geometry: [geometry.0, geometry.1],
             uptime: shared.started.elapsed().as_secs(),
         },
-        message: shared.message.lock().unwrap().clone(),
+        message: shared.card.message.lock().unwrap().clone(),
         recording: shared
             .recording_status()
             .map(|s| hd60s_api::RecordingStatus {
@@ -91,32 +91,34 @@ pub fn state(shared: &Shared) -> State {
                 bytes: s.bytes,
                 dropped: s.dropped_frames,
             }),
-        record_dir: shared.record_dir.display().to_string(),
+        record_dir: shared.recorder.dir.display().to_string(),
         encoder: shared
-            .resolved_encoder
+            .recorder
+            .resolved
             .lock()
             .unwrap()
             .map(|e| e.name())
-            .unwrap_or(shared.record_encoder.name())
+            .unwrap_or(shared.recorder.encoder.name())
             .to_string(),
         network_stream: shared
-            .stream_bind
+            .network
+            .bind
             .as_ref()
             .map(|bind| hd60s_api::NetworkStream {
-                enabled: shared.network_stream.load(Ordering::Relaxed),
+                enabled: shared.network.enabled.load(Ordering::Relaxed),
                 url: format!(
                     "http://{}:{}/stream.mjpg",
                     hostname(),
                     bind.rsplit(':').next().unwrap_or("8061")
                 ),
-                clients: shared.stream_clients.load(Ordering::Relaxed),
-                fps: shared.stream_fps,
-                scale: shared.stream_scale,
+                clients: shared.network.clients.load(Ordering::Relaxed),
+                fps: shared.network.fps,
+                scale: shared.network.scale,
             }),
         ..Default::default()
     };
-    let control = shared.control.lock().unwrap();
-    let snapshot = shared.snapshot.lock().unwrap();
+    let control = shared.card.control.lock().unwrap();
+    let snapshot = shared.card.snapshot.lock().unwrap();
     match control.as_ref() {
         Some(control) => {
             state.device = hd60s_api::Device {
@@ -203,7 +205,7 @@ fn hostname() -> String {
 
 /// `POST /api/set`: picture registers, colour range, gain, or a reset.
 fn apply(shared: &Shared, request: &Request) -> Result<String, String> {
-    let control = shared.control.lock().unwrap();
+    let control = shared.card.control.lock().unwrap();
     let control = control.as_ref().ok_or("no HD60 S attached")?;
     let mut changed = Vec::new();
     if request.get("reset").is_some() {
@@ -235,7 +237,7 @@ fn apply(shared: &Shared, request: &Request) -> Result<String, String> {
 }
 
 fn preview(shared: &Shared, factor: usize, quality: u8) -> Option<Vec<u8>> {
-    let frame = shared.latest.lock().unwrap().clone()?;
+    let frame = shared.video.latest.lock().unwrap().clone()?;
     jpeg_from_yuyv(&frame, factor, quality)
 }
 
@@ -288,7 +290,7 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>, trusted: bool) {
         return;
     };
     if !trusted
-        && let Some(bind) = &shared.panel_bind
+        && let Some(bind) = &shared.panel.bind
         && !host_allowed(&request, bind)
     {
         respond(
@@ -299,7 +301,7 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>, trusted: bool) {
         );
         return;
     }
-    if !trusted && request.method != "GET" && !request.authorised(&shared.panel_token) {
+    if !trusted && request.method != "GET" && !request.authorised(&shared.panel.token) {
         respond(
             &mut stream,
             "403 Forbidden",
@@ -318,7 +320,7 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>, trusted: bool) {
             &mut stream,
             "200 OK",
             "text/html; charset=utf-8",
-            PAGE.replace("__TOKEN__", &shared.panel_token).as_bytes(),
+            PAGE.replace("__TOKEN__", &shared.panel.token).as_bytes(),
         ),
         ("GET", "/api/state") => respond_json(&mut stream, "200 OK", &state(&shared)),
         ("POST", "/api/set") => match apply(&shared, &request) {
@@ -361,7 +363,7 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>, trusted: bool) {
         }
         ("POST", "/api/stream") => {
             let on = request.get("on").is_some();
-            shared.network_stream.store(on, Ordering::Relaxed);
+            shared.network.enabled.store(on, Ordering::Relaxed);
             eprintln!("network stream switched {}", if on { "on" } else { "off" });
             answer(
                 &mut stream,
@@ -370,6 +372,7 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>, trusted: bool) {
         }
         ("GET", "/edid.bin") => {
             let block = shared
+                .card
                 .snapshot
                 .lock()
                 .unwrap()
@@ -386,7 +389,7 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>, trusted: bool) {
             }
         }
         ("GET", "/frame.yuyv") => {
-            let frame = shared.latest.lock().unwrap().clone();
+            let frame = shared.video.latest.lock().unwrap().clone();
             match frame {
                 Some(frame) => respond(&mut stream, "200 OK", "application/octet-stream", &frame),
                 None => respond(&mut stream, "204 No Content", "text/plain", b""),

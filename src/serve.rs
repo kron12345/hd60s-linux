@@ -39,47 +39,75 @@ const AUDIO_CHANNELS: u32 = 2;
 /// One second of audio; anything older is dropped rather than delaying the picture.
 const AUDIO_RING_BYTES: usize = (AUDIO_RATE * AUDIO_CHANNELS * 2) as usize;
 
-/// State shared between the pump, the PipeWire threads and the panel.
+/// State shared between the pump, the PipeWire threads, the API and the
+/// recorder, grouped by concern.
 pub struct Shared {
-    pub latest: Mutex<Option<Arc<Vec<u8>>>>,
-    pub audio: Mutex<VecDeque<u8>>,
     pub stop: AtomicBool,
-    pub stats: Arc<Mutex<frame::Stats>>,
+    pub started: std::time::Instant,
+    pub video: Video,
+    /// Captured audio, s16le stereo 48 kHz; one second at most, older
+    /// samples are dropped rather than delaying the picture.
+    pub audio: Mutex<VecDeque<u8>>,
+    pub card: Card,
+    pub recorder: Recorder,
+    pub network: Network,
+    pub panel: PanelAccess,
+}
+
+/// The picture as it flows: the latest letterboxed frame and the counters.
+pub struct Video {
+    pub latest: Mutex<Option<Arc<Vec<u8>>>>,
     /// Width and height of the source before letterboxing.
     pub geometry: Mutex<(usize, usize)>,
-    pub device_present: AtomicBool,
-    pub started: std::time::Instant,
+    pub stats: Arc<Mutex<frame::Stats>>,
     /// Arrival times of the frames of the last few seconds.
-    frame_times: Mutex<VecDeque<std::time::Instant>>,
-    /// Register access through the streaming handle while the device is
-    /// attached; `None` in between.
+    pub frame_times: Mutex<VecDeque<std::time::Instant>>,
+    /// Whether a source (card or recording) is being streamed right now.
+    pub device_present: AtomicBool,
+}
+
+/// The card while it is attached: register access through the streaming
+/// handle, the pre-stream snapshot, and jobs that need the stream stopped.
+pub struct Card {
+    /// `None` between attachments.
     pub control: Mutex<Option<Control>>,
     /// Microcontroller and EDID state read before the stream started.
     pub snapshot: Mutex<Option<Snapshot>>,
     /// An EDID to write once the stream has been stopped for it.
-    pending_edid: Mutex<Option<[u8; 256]>>,
+    pub pending_edid: Mutex<Option<[u8; 256]>>,
     /// Stops the current stream run (the pump reattaches a second later).
-    run_stop: Mutex<Option<Arc<AtomicBool>>>,
-    /// Outcome of the last deferred job, for the panel.
+    pub run_stop: Mutex<Option<Arc<AtomicBool>>>,
+    /// Outcome of the last deferred job, for the clients.
     pub message: Mutex<Option<String>>,
-    /// A running recording, if any.
-    pub recording: Mutex<Option<Recording>>,
-    pub record_dir: std::path::PathBuf,
-    pub record_encoder: record::Encoder,
+}
+
+pub struct Recorder {
+    pub current: Mutex<Option<Recording>>,
+    pub dir: std::path::PathBuf,
+    pub encoder: record::Encoder,
     /// The encoder actually used once `Auto` has been probed.
-    pub resolved_encoder: Mutex<Option<record::Encoder>>,
-    /// The optional MJPEG stream for other machines: switch and address.
-    pub network_stream: AtomicBool,
-    pub stream_bind: Option<String>,
-    pub stream_fps: u32,
-    pub stream_scale: usize,
-    pub stream_clients: std::sync::atomic::AtomicUsize,
-    /// Required in the URL of the network stream when set.
-    pub stream_token: Option<String>,
-    /// Required for every changing request to the panel; new at each start,
-    /// embedded in the page and written to `$XDG_RUNTIME_DIR/hd60s-linux/token`.
-    pub panel_token: String,
-    pub panel_bind: Option<String>,
+    pub resolved: Mutex<Option<record::Encoder>>,
+}
+
+/// The optional MJPEG stream for other machines.
+pub struct Network {
+    pub enabled: AtomicBool,
+    /// `None` leaves the feature out.
+    pub bind: Option<String>,
+    pub fps: u32,
+    pub scale: usize,
+    pub clients: std::sync::atomic::AtomicUsize,
+    /// Required in the URL when set.
+    pub token: Option<String>,
+}
+
+/// What guards the TCP panel against browsers (the Unix socket needs none
+/// of it).
+pub struct PanelAccess {
+    /// New at each start, embedded in the page and written to
+    /// `$XDG_RUNTIME_DIR/hd60s-linux/token` for scripts.
+    pub token: String,
+    pub bind: Option<String>,
 }
 
 fn random_token() -> String {
@@ -119,18 +147,18 @@ fn publish_token(token: &str) {
 impl Shared {
     /// Starts recording to a new file in `record_dir`.
     pub fn start_recording(&self) -> Result<record::Status, String> {
-        let mut slot = self.recording.lock().unwrap();
+        let mut slot = self.recorder.current.lock().unwrap();
         if slot.is_some() {
             return Err("already recording".into());
         }
-        if !self.device_present.load(Ordering::Relaxed) {
+        if !self.video.device_present.load(Ordering::Relaxed) {
             return Err("nothing to record: no stream".into());
         }
         let encoder = {
-            let mut resolved = self.resolved_encoder.lock().unwrap();
-            *resolved.get_or_insert_with(|| self.record_encoder.resolve())
+            let mut resolved = self.recorder.resolved.lock().unwrap();
+            *resolved.get_or_insert_with(|| self.recorder.encoder.resolve())
         };
-        let recording = Recording::start(&self.record_dir, encoder, CANVAS_WIDTH, CANVAS_HEIGHT)?;
+        let recording = Recording::start(&self.recorder.dir, encoder, CANVAS_WIDTH, CANVAS_HEIGHT)?;
         let status = recording.status();
         eprintln!(
             "recording to {} (encoder {})",
@@ -143,7 +171,8 @@ impl Shared {
 
     pub fn stop_recording(&self) -> Result<record::Status, String> {
         let recording = self
-            .recording
+            .recorder
+            .current
             .lock()
             .unwrap()
             .take()
@@ -164,7 +193,7 @@ impl Shared {
 
     /// Status of the running recording; clears it if ffmpeg has died.
     pub fn recording_status(&self) -> Option<record::Status> {
-        let mut slot = self.recording.lock().unwrap();
+        let mut slot = self.recorder.current.lock().unwrap();
         let alive = slot.as_mut().map(|r| r.alive());
         match alive {
             Some(true) => slot.as_ref().map(|r| r.status()),
@@ -175,7 +204,7 @@ impl Shared {
                     "recording ended unexpectedly (ffmpeg exited): {}",
                     status.path.display()
                 );
-                *self.message.lock().unwrap() =
+                *self.card.message.lock().unwrap() =
                     Some("recording ended unexpectedly (ffmpeg exited)".into());
                 None
             }
@@ -188,11 +217,11 @@ impl Shared {
     /// the block written, and the device picked up again.
     pub fn request_edid_write(&self, block: [u8; 256]) -> Result<(), String> {
         crate::edid::validate(&block)?;
-        if self.control.lock().unwrap().is_none() {
+        if self.card.control.lock().unwrap().is_none() {
             return Err("no HD60 S attached".into());
         }
-        *self.pending_edid.lock().unwrap() = Some(block);
-        if let Some(stop) = self.run_stop.lock().unwrap().as_ref() {
+        *self.card.pending_edid.lock().unwrap() = Some(block);
+        if let Some(stop) = self.card.run_stop.lock().unwrap().as_ref() {
             stop.store(true, Ordering::Relaxed);
         }
         Ok(())
@@ -200,7 +229,7 @@ impl Shared {
 
     /// Frames per second over the last five seconds.
     pub fn recent_fps(&self) -> f64 {
-        let mut times = self.frame_times.lock().unwrap();
+        let mut times = self.video.frame_times.lock().unwrap();
         let now = std::time::Instant::now();
         while times
             .front()
@@ -217,7 +246,7 @@ impl Shared {
     }
 
     fn note_frame(&self) {
-        let mut times = self.frame_times.lock().unwrap();
+        let mut times = self.video.frame_times.lock().unwrap();
         times.push_back(std::time::Instant::now());
         if times.len() > 600 {
             times.pop_front();
@@ -254,31 +283,41 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
     publish_token(&panel_token);
     pw::init();
     let shared = Arc::new(Shared {
-        latest: Mutex::new(None),
-        audio: Mutex::new(VecDeque::with_capacity(AUDIO_RING_BYTES)),
         stop: AtomicBool::new(false),
-        stats: Arc::new(Mutex::new(frame::Stats::default())),
-        geometry: Mutex::new((0, 0)),
-        device_present: AtomicBool::new(false),
         started: std::time::Instant::now(),
-        frame_times: Mutex::new(VecDeque::with_capacity(512)),
-        control: Mutex::new(None),
-        snapshot: Mutex::new(None),
-        pending_edid: Mutex::new(None),
-        run_stop: Mutex::new(None),
-        message: Mutex::new(None),
-        recording: Mutex::new(None),
-        record_dir,
-        record_encoder,
-        resolved_encoder: Mutex::new(None),
-        network_stream: AtomicBool::new(stream_on),
-        stream_bind: stream_bind.clone(),
-        stream_fps,
-        stream_scale,
-        stream_clients: std::sync::atomic::AtomicUsize::new(0),
-        stream_token,
-        panel_token,
-        panel_bind: panel.clone(),
+        video: Video {
+            latest: Mutex::new(None),
+            geometry: Mutex::new((0, 0)),
+            stats: Arc::new(Mutex::new(frame::Stats::default())),
+            frame_times: Mutex::new(VecDeque::with_capacity(512)),
+            device_present: AtomicBool::new(false),
+        },
+        audio: Mutex::new(VecDeque::with_capacity(AUDIO_RING_BYTES)),
+        card: Card {
+            control: Mutex::new(None),
+            snapshot: Mutex::new(None),
+            pending_edid: Mutex::new(None),
+            run_stop: Mutex::new(None),
+            message: Mutex::new(None),
+        },
+        recorder: Recorder {
+            current: Mutex::new(None),
+            dir: record_dir,
+            encoder: record_encoder,
+            resolved: Mutex::new(None),
+        },
+        network: Network {
+            enabled: AtomicBool::new(stream_on),
+            bind: stream_bind.clone(),
+            fps: stream_fps,
+            scale: stream_scale,
+            clients: std::sync::atomic::AtomicUsize::new(0),
+            token: stream_token,
+        },
+        panel: PanelAccess {
+            token: panel_token,
+            bind: panel.clone(),
+        },
     });
     if let Some(address) = stream_bind {
         let stream_shared = shared.clone();
@@ -313,16 +352,16 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
     let pump_stop = stop.clone();
     let pump_thread = std::thread::spawn(move || -> Result<(), String> {
         let on_frame = |shared: &Shared, frame: frame::Frame| {
-            *shared.geometry.lock().unwrap() = (frame.width, frame.height);
+            *shared.video.geometry.lock().unwrap() = (frame.width, frame.height);
             shared.note_frame();
             let pixels = Arc::new(letterbox(frame, CANVAS_WIDTH, CANVAS_HEIGHT));
-            if let Some(recording) = shared.recording.lock().unwrap().as_ref() {
+            if let Some(recording) = shared.recorder.current.lock().unwrap().as_ref() {
                 recording.push_frame(pixels.clone());
             }
-            *shared.latest.lock().unwrap() = Some(pixels);
+            *shared.video.latest.lock().unwrap() = Some(pixels);
         };
         let on_audio = |shared: &Shared, bytes: Vec<u8>| {
-            if let Some(recording) = shared.recording.lock().unwrap().as_ref() {
+            if let Some(recording) = shared.recorder.current.lock().unwrap().as_ref() {
                 recording.push_audio(&bytes);
             }
             let mut ring = shared.audio.lock().unwrap();
@@ -334,12 +373,15 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
         };
         match source {
             Source::File { path, fps } => {
-                pump_shared.device_present.store(true, Ordering::Relaxed);
+                pump_shared
+                    .video
+                    .device_present
+                    .store(true, Ordering::Relaxed);
                 let result = pump::run_with_stats(
                     Input::<Context>::File { path, fps },
                     pump_stop,
                     None,
-                    Some(pump_shared.stats.clone()),
+                    Some(pump_shared.video.stats.clone()),
                     |frame| on_frame(&pump_shared, frame),
                     |bytes| on_audio(&pump_shared, bytes),
                 );
@@ -396,31 +438,37 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
                                 .unwrap_or_else(|error| format!("unknown: {error}"))
                         );
                     }
-                    *pump_shared.snapshot.lock().unwrap() = Some(snapshot);
-                    *pump_shared.control.lock().unwrap() = Some(control);
+                    *pump_shared.card.snapshot.lock().unwrap() = Some(snapshot);
+                    *pump_shared.card.control.lock().unwrap() = Some(control);
                     let run_stop = Arc::new(AtomicBool::new(false));
-                    *pump_shared.run_stop.lock().unwrap() = Some(run_stop.clone());
-                    pump_shared.device_present.store(true, Ordering::Relaxed);
+                    *pump_shared.card.run_stop.lock().unwrap() = Some(run_stop.clone());
+                    pump_shared
+                        .video
+                        .device_present
+                        .store(true, Ordering::Relaxed);
                     let result = pump::run_with_stats(
                         Input::Usb(handle.clone()),
                         run_stop,
                         None,
-                        Some(pump_shared.stats.clone()),
+                        Some(pump_shared.video.stats.clone()),
                         |frame| on_frame(&pump_shared, frame),
                         |bytes| on_audio(&pump_shared, bytes),
                     );
                     // Gone (unplugged, reset, or claimed elsewhere): show black,
                     // keep the nodes, and wait for it to come back.
-                    *pump_shared.latest.lock().unwrap() = None;
+                    *pump_shared.video.latest.lock().unwrap() = None;
                     pump_shared.audio.lock().unwrap().clear();
-                    pump_shared.device_present.store(false, Ordering::Relaxed);
-                    *pump_shared.geometry.lock().unwrap() = (0, 0);
-                    pump_shared.frame_times.lock().unwrap().clear();
-                    *pump_shared.run_stop.lock().unwrap() = None;
+                    pump_shared
+                        .video
+                        .device_present
+                        .store(false, Ordering::Relaxed);
+                    *pump_shared.video.geometry.lock().unwrap() = (0, 0);
+                    pump_shared.video.frame_times.lock().unwrap().clear();
+                    *pump_shared.card.run_stop.lock().unwrap() = None;
                     // Deferred jobs that needed the stream stopped.
-                    let pending = pump_shared.pending_edid.lock().unwrap().take();
+                    let pending = pump_shared.card.pending_edid.lock().unwrap().take();
                     if let Some(block) = pending {
-                        let control = pump_shared.control.lock().unwrap();
+                        let control = pump_shared.card.control.lock().unwrap();
                         let message = match control.as_ref().map(|c| c.write_edid(&block)) {
                             Some(Ok(differing)) => format!(
                                 "EDID written ({differing} byte(s) adjusted by the device); the source re-reads it on the next HDMI hot-plug"
@@ -429,10 +477,10 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
                             None => "EDID write skipped: device gone".to_string(),
                         };
                         eprintln!("{message}");
-                        *pump_shared.message.lock().unwrap() = Some(message);
+                        *pump_shared.card.message.lock().unwrap() = Some(message);
                         last_end = None; // announce the reattach
                     }
-                    *pump_shared.control.lock().unwrap() = None;
+                    *pump_shared.card.control.lock().unwrap() = None;
                     drop(handle);
                     // Report once per distinct outcome, not once per retry: another
                     // instance holding the interface would otherwise log every second.
@@ -501,7 +549,7 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
                 quit.quit();
                 return;
             }
-            let latest = fill_shared.latest.lock().unwrap();
+            let latest = fill_shared.video.latest.lock().unwrap();
             match (latest.as_ref().map(|p| p.as_slice()), frame.format) {
                 (Some(pixels), Format::Yuy2)
                     if pixels.len() == CANVAS_WIDTH * CANVAS_HEIGHT * 2 =>
@@ -522,7 +570,7 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
 
     stop.store(true, Ordering::Relaxed);
     shared.stop.store(true, Ordering::Relaxed);
-    if shared.recording.lock().unwrap().is_some() {
+    if shared.recorder.current.lock().unwrap().is_some() {
         let _ = shared.stop_recording();
     }
     let pump_result = pump_thread

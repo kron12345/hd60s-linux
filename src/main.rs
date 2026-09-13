@@ -216,6 +216,12 @@ fn run(command: &str, args: Args) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    // A closed pipe (`hd60s-linux capture | head -c ...`) ends the program
+    // quietly instead of panicking on the next print.
+    // SAFETY: resetting SIGPIPE to its default disposition has no other effect.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
         eprintln!("{USAGE}");

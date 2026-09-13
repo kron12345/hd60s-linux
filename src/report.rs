@@ -173,17 +173,17 @@ pub fn text(show_serial: bool, capture_seconds: u64) -> String {
 /// place of a test capture.
 pub fn from_shared(shared: &Shared, show_serial: bool) -> String {
     let mut lines = header();
-    let control = shared.control.lock().unwrap();
-    let snapshot = shared.snapshot.lock().unwrap();
+    let control = shared.card.control.lock().unwrap();
+    let snapshot = shared.card.snapshot.lock().unwrap();
     match (control.as_ref(), snapshot.as_ref()) {
         (Some(control), Some(snapshot)) => lines.extend(describe(control, snapshot, show_serial)),
         _ => lines.push("- device: not attached".to_string()),
     }
-    let stats = *shared.stats.lock().unwrap();
-    let geometry = *shared.geometry.lock().unwrap();
+    let stats = *shared.video.stats.lock().unwrap();
+    let geometry = *shared.video.geometry.lock().unwrap();
     lines.push(format!(
         "- stream: {}, {:.1} fps now, {} frame(s), {} bad, {} format change(s), {} audio block(s), source {}x{}, up {} s",
-        if shared.device_present.load(Ordering::Relaxed) { "running" } else { "waiting for the card" },
+        if shared.video.device_present.load(Ordering::Relaxed) { "running" } else { "waiting for the card" },
         shared.recent_fps(),
         stats.frames,
         stats.bad_frames,
