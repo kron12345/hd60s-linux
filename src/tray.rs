@@ -92,7 +92,12 @@ impl Tray {
         }
     }
 
+    /// The native control program when it is installed, the web panel
+    /// otherwise.
     fn open_panel(&self) {
+        if std::process::Command::new("hd60s-control").spawn().is_ok() {
+            return;
+        }
         if let Some(url) = &self.panel_url {
             let _ = std::process::Command::new("xdg-open").arg(url).spawn();
         }
@@ -177,7 +182,7 @@ impl ksni::Tray for Tray {
         ];
         if self.panel_url.is_some() {
             items.push(MenuItem::Standard(StandardItem {
-                label: "Open control panel".into(),
+                label: "Open control program".into(),
                 activate: Box::new(|tray: &mut Self| tray.open_panel()),
                 ..Default::default()
             }));

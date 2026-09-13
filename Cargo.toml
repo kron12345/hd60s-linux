@@ -7,6 +7,9 @@ description = "Experimental userspace Linux driver for the original Elgato HD60 
 license = "MIT"
 repository = "https://github.com/Hydrogen2K/hd60s-linux"
 
+[workspace]
+members = [".", "control"]
+
 [dependencies]
 jpeg-encoder = "0.7"
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
@@ -22,11 +25,14 @@ rusb = "0.9.4"
 suggests = "ffmpeg"
 maintainer = "Sebastian Ortwein <kron@animeland.de>"
 extended-description = "Elgato Game Capture HD60 S as a PipeWire camera and microphone: a userspace driver, no kernel module."
-depends = "libpipewire-0.3-0, libusb-1.0-0, pipewire"
+depends = "libpipewire-0.3-0, libusb-1.0-0, pipewire, libfontconfig1, libxkbcommon0, libwayland-client0, libegl1"
 section = "video"
 priority = "optional"
 assets = [
     ["target/release/hd60s-linux", "usr/bin/", "755"],
+    ["target/release/hd60s-control", "usr/bin/", "755"],
+    ["packaging/hd60s-control.desktop", "usr/share/applications/", "644"],
+    ["packaging/hd60s-control.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
     ["packaging/70-hd60s-linux.rules", "usr/lib/udev/rules.d/", "644"],
     ["packaging/hd60s-serve.service", "usr/lib/systemd/user/", "644"],
     ["README.md", "usr/share/doc/hd60s-linux/", "644"],

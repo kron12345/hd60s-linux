@@ -1,0 +1,165 @@
+import { Button, Slider, ComboBox, CheckBox, VerticalBox, HorizontalBox, GroupBox, TextEdit, ScrollView } from "std-widgets.slint";
+
+component LabeledSlider inherits HorizontalBox {
+    in property <string> label;
+    in-out property <int> value: 128;
+    in property <bool> enabled: true;
+    callback released(int);
+    callback dragging();
+    padding: 0;
+    Text { text: root.label; width: 90px; vertical-alignment: center; }
+    Slider {
+        minimum: 0; maximum: 255; enabled: root.enabled;
+        value: root.value;
+        changed => { root.dragging(); }
+        released(v) => { root.value = Math.round(v); root.released(root.value); }
+    }
+    Text { text: root.value; width: 36px; horizontal-alignment: right; vertical-alignment: center; }
+}
+
+export component MainWindow inherits Window {
+    title: "Elgato HD60 S";
+    icon: @image-url("../../packaging/hd60s-control.png");
+    preferred-width: 1240px;
+    preferred-height: 720px;
+    min-width: 900px;
+    min-height: 560px;
+
+    in-out property <image> preview;
+    in-out property <bool> connected: false;
+    in-out property <bool> device-present: false;
+    in-out property <string> headline: "connecting to the service…";
+    in-out property <string> input-text: "–";
+    in-out property <string> stream-text: "–";
+    in-out property <string> device-text: "";
+    in-out property <string> edid-text: "";
+    in-out property <string> mcu-text: "";
+    in-out property <string> message: "";
+    in-out property <int> brightness: 128;
+    in-out property <int> contrast: 128;
+    in-out property <int> saturation: 128;
+    in-out property <int> hue: 128;
+    in-out property <int> gain: 128;
+    in-out property <string> gain-db: "0.0 dB";
+    in-out property <int> range-index: 0;
+    in-out property <bool> recording: false;
+    in-out property <string> recording-text: "off";
+    in-out property <bool> stream-available: false;
+    in-out property <bool> stream-on: false;
+    in-out property <string> network-text: "";
+    in-out property <string> report-text: "";
+    // Set while a slider is dragged so that the periodic state refresh
+    // does not move it under the pointer.
+    in-out property <bool> interacting: false;
+
+    callback set-control(string, int);
+    callback set-range(int);
+    callback set-gain(int);
+    callback reset-picture();
+    callback toggle-record();
+    callback toggle-stream();
+    callback restore-edid();
+    callback generate-report();
+
+    HorizontalBox {
+        VerticalBox {
+            Text { text: root.headline; font-size: 15px; font-weight: 700; }
+            Rectangle {
+                background: #000;
+                border-radius: 6px;
+                Image {
+                    width: 100%; height: 100%;
+                    source: root.preview;
+                    image-fit: contain;
+                }
+            }
+            HorizontalBox {
+                padding: 0;
+                Text { text: "Input"; color: #888; width: 90px; }
+                Text { text: root.input-text; }
+            }
+            HorizontalBox {
+                padding: 0;
+                Text { text: "Stream"; color: #888; width: 90px; }
+                Text { text: root.stream-text; wrap: word-wrap; }
+            }
+            HorizontalBox {
+                padding: 0;
+                Text { text: "Recording"; color: #888; width: 90px; }
+                Text { text: root.recording-text; wrap: word-wrap; }
+                Button {
+                    text: root.recording ? "■ Stop recording" : "● Start recording";
+                    enabled: root.device-present || root.recording;
+                    clicked => { root.toggle-record(); }
+                }
+            }
+            HorizontalBox {
+                padding: 0;
+                Text { text: "Network"; color: #888; width: 90px; }
+                Text { text: root.network-text; wrap: word-wrap; }
+                CheckBox {
+                    text: "MJPEG stream on";
+                    enabled: root.stream-available;
+                    checked: root.stream-on;
+                    toggled => { root.toggle-stream(); }
+                }
+            }
+            Text { text: root.message; color: #888; }
+        }
+        ScrollView {
+            width: 420px;
+            VerticalBox {
+            GroupBox {
+                title: "Picture";
+                VerticalBox {
+                    padding: 0;
+                    LabeledSlider { label: "Brightness"; value <=> root.brightness; enabled: root.device-present; dragging => { root.interacting = true; } released(v) => { root.interacting = false; root.set-control("brightness", v); } }
+                    LabeledSlider { label: "Contrast"; value <=> root.contrast; enabled: root.device-present; dragging => { root.interacting = true; } released(v) => { root.interacting = false; root.set-control("contrast", v); } }
+                    LabeledSlider { label: "Saturation"; value <=> root.saturation; enabled: root.device-present; dragging => { root.interacting = true; } released(v) => { root.interacting = false; root.set-control("saturation", v); } }
+                    LabeledSlider { label: "Hue"; value <=> root.hue; enabled: root.device-present; dragging => { root.interacting = true; } released(v) => { root.interacting = false; root.set-control("hue", v); } }
+                    HorizontalBox {
+                        padding: 0;
+                        Text { text: "Colour range"; width: 90px; vertical-alignment: center; }
+                        ComboBox {
+                            model: ["bypass (default)", "shrink", "expand"];
+                            enabled: root.device-present;
+                            current-index <=> root.range-index;
+                            selected => { root.set-range(self.current-index); }
+                        }
+                    }
+                    LabeledSlider { label: "Audio gain"; value <=> root.gain; enabled: root.device-present; dragging => { root.interacting = true; } released(v) => { root.interacting = false; root.set-gain(v); } }
+                    HorizontalBox {
+                        padding: 0;
+                        Text { text: root.gain-db; color: #888; }
+                        Button { text: "Reset all to neutral"; enabled: root.device-present; clicked => { root.reset-picture(); } }
+                    }
+                }
+            }
+            GroupBox {
+                title: "Device";
+                Text { text: root.device-text; wrap: word-wrap; }
+            }
+            GroupBox {
+                title: "EDID";
+                VerticalBox {
+                    padding: 0;
+                    Text { text: root.edid-text; wrap: word-wrap; }
+                    Button { text: "Restore power-on EDID (pauses the stream)"; enabled: root.device-present; clicked => { root.restore-edid(); } }
+                }
+            }
+            GroupBox {
+                title: "Microcontroller";
+                Text { text: root.mcu-text; wrap: word-wrap; }
+            }
+            GroupBox {
+                title: "Report";
+                VerticalBox {
+                    padding: 0;
+                    Button { text: "Generate report for an issue"; clicked => { root.generate-report(); } }
+                    TextEdit { text: root.report-text; read-only: true; height: 160px; wrap: word-wrap; }
+                }
+            }
+            }
+        }
+    }
+}

@@ -299,6 +299,15 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
             }
         });
     }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let socket = std::path::PathBuf::from(runtime).join("hd60s-linux/api.sock");
+        let socket_shared = shared.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = crate::panel::run_unix(&socket, socket_shared) {
+                eprintln!("API socket: {error}");
+            }
+        });
+    }
     if tray {
         let tray_shared = shared.clone();
         let url = panel.as_ref().map(|address| format!("http://{address}/"));

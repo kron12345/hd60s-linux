@@ -4,8 +4,8 @@
 //! its own address because the panel stays on localhost; there is no
 //! authentication, so keep it on a trusted network.
 
-use std::io::Write;
-use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -37,7 +37,7 @@ pub fn run(address: &str, shared: Arc<Shared>) -> Result<(), String> {
     Ok(())
 }
 
-fn handle(mut stream: TcpStream, shared: Arc<Shared>) {
+fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>) {
     let Some(request) = parse(&mut stream) else {
         return;
     };
@@ -94,7 +94,7 @@ fn handle(mut stream: TcpStream, shared: Arc<Shared>) {
     }
 }
 
-fn mjpeg(stream: &mut TcpStream, shared: &Shared, scale: usize, quality: u8, fps: u32) {
+fn mjpeg<W: Write>(stream: &mut W, shared: &Shared, scale: usize, quality: u8, fps: u32) {
     let head = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
     if stream.write_all(head.as_bytes()).is_err() {
         return;

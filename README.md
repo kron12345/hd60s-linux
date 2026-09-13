@@ -68,6 +68,18 @@ instance: a second one finds the interface busy and just keeps waiting.
 the node names; `--from-file RAW [--fps N]` replays a recorded raw stream
 instead of the device, for development without hardware.
 
+### Control program
+
+`hd60s-control` (in the application menu as *HD60 S Control*, or from the
+tray icon) is the native window for the service: the live picture,
+picture controls, colour range and audio gain, device, EDID and
+microcontroller status, recording, the network stream switch and the
+report. It is written in Rust with [Slint](https://slint.dev) and runs on
+Wayland (Plasma, sway) and X11. It talks to the service over
+`$XDG_RUNTIME_DIR/hd60s-linux/api.sock`, which only the same user can
+reach — no port, no token, nothing a browser can get at. The web panel
+below offers the same over HTTP for remote or scripted use.
+
 ### Control panel
 
 While `serve` runs it also serves a control panel on

@@ -9,7 +9,7 @@
 //! request; that needs no interface claim, so it works while streaming.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -30,7 +30,7 @@ pub fn run(address: &str, shared: Arc<Shared>) -> Result<(), String> {
         }
         let Ok(stream) = stream else { continue };
         let shared = shared.clone();
-        std::thread::spawn(move || handle(stream, shared));
+        std::thread::spawn(move || handle(stream, shared, false));
     }
     Ok(())
 }
@@ -79,7 +79,7 @@ impl Request {
     }
 }
 
-pub(crate) fn parse(stream: &mut TcpStream) -> Option<Request> {
+pub(crate) fn parse<S: Read>(stream: &mut S) -> Option<Request> {
     let mut buffer = [0_u8; 8192];
     let mut data = Vec::new();
     loop {
@@ -148,7 +148,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub(crate) fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
+pub(crate) fn respond<W: Write>(stream: &mut W, status: &str, content_type: &str, body: &[u8]) {
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
@@ -426,11 +426,36 @@ pub(crate) fn host_allowed(request: &Request, bind: &str) -> bool {
         .any(|name| host == format!("{name}:{port}"))
 }
 
-fn handle(mut stream: TcpStream, shared: Arc<Shared>) {
+/// Serves the same API on a Unix socket for programs of the same user
+/// (`hd60s-control`); the socket's permissions replace the token.
+pub fn run_unix(path: &std::path::Path, shared: Arc<Shared>) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
+    }
+    let _ = std::fs::remove_file(path);
+    let listener = std::os::unix::net::UnixListener::bind(path)
+        .map_err(|error| format!("binding the API socket {}: {error}", path.display()))?;
+    eprintln!("API socket at {}", path.display());
+    for stream in listener.incoming() {
+        if shared.stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let Ok(stream) = stream else { continue };
+        let shared = shared.clone();
+        std::thread::spawn(move || handle(stream, shared, true));
+    }
+    Ok(())
+}
+
+/// One connection. `trusted` (the Unix socket) skips the token and the
+/// Host and Origin checks that protect the TCP port from browsers.
+fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>, trusted: bool) {
     let Some(request) = parse(&mut stream) else {
         return;
     };
-    if let Some(bind) = &shared.panel_bind
+    if !trusted
+        && let Some(bind) = &shared.panel_bind
         && !host_allowed(&request, bind)
     {
         respond(
@@ -441,7 +466,7 @@ fn handle(mut stream: TcpStream, shared: Arc<Shared>) {
         );
         return;
     }
-    if request.method != "GET" && !request.authorised(&shared.panel_token) {
+    if !trusted && request.method != "GET" && !request.authorised(&shared.panel_token) {
         respond(
             &mut stream,
             "403 Forbidden",
@@ -558,6 +583,13 @@ fn handle(mut stream: TcpStream, shared: Arc<Shared>) {
                     "text/plain",
                     b"no EDID read yet",
                 ),
+            }
+        }
+        ("GET", "/frame.yuyv") => {
+            let frame = shared.latest.lock().unwrap().clone();
+            match frame {
+                Some(frame) => respond(&mut stream, "200 OK", "application/octet-stream", &frame),
+                None => respond(&mut stream, "204 No Content", "text/plain", b""),
             }
         }
         ("GET", "/preview.jpg") => match preview(

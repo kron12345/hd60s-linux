@@ -2,13 +2,13 @@
 pkgname=hd60s-linux-git
 pkgver=r0
 pkgrel=1
-pkgdesc="Elgato Game Capture HD60 S as a PipeWire camera and microphone (userspace, no kernel module)"
+pkgdesc="Elgato Game Capture HD60 S as a PipeWire camera and microphone, with control program (userspace, no kernel module)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/kron12345/hd60s-linux"
 license=('MIT')
 # The libspa-sys C shim must not be compiled with GCC LTO: Rust links with lld.
 options=(!lto)
-depends=('libpipewire' 'libusb' 'pipewire')
+depends=('libpipewire' 'libusb' 'pipewire' 'fontconfig' 'libxkbcommon' 'wayland' 'libglvnd')
 optdepends=('ffmpeg: recording from the panel or the tray')
 makedepends=('git' 'cargo' 'clang' 'pkgconf')
 provides=('hd60s-linux')
@@ -25,18 +25,21 @@ pkgver() {
 build() {
   cd hd60s-linux
   export CARGO_HOME="$srcdir/cargo-home"
-  cargo build --release --locked
+  cargo build --release --locked --workspace
 }
 
 check() {
   cd hd60s-linux
   export CARGO_HOME="$srcdir/cargo-home"
-  cargo test --release --locked
+  cargo test --release --locked --workspace
 }
 
 package() {
   cd hd60s-linux
   install -Dm755 target/release/hd60s-linux "$pkgdir/usr/bin/hd60s-linux"
+  install -Dm755 target/release/hd60s-control "$pkgdir/usr/bin/hd60s-control"
+  install -Dm644 packaging/hd60s-control.desktop "$pkgdir/usr/share/applications/hd60s-control.desktop"
+  install -Dm644 packaging/hd60s-control.png "$pkgdir/usr/share/icons/hicolor/128x128/apps/hd60s-control.png"
   install -Dm644 packaging/70-hd60s-linux.rules "$pkgdir/usr/lib/udev/rules.d/70-hd60s-linux.rules"
   install -Dm644 packaging/hd60s-serve.service "$pkgdir/usr/lib/systemd/user/hd60s-serve.service"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"

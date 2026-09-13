@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=HD60 S Control
+GenericName=Capture card control
+Comment=Live picture, settings, recording and stream of the Elgato HD60 S service
+Exec=hd60s-control
+Icon=hd60s-control
+Terminal=false
+Categories=AudioVideo;Video;Settings;
+Keywords=Elgato;capture;HDMI;
