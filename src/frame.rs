@@ -84,7 +84,9 @@ pub enum Event {
 #[derive(Default, Clone, Copy)]
 pub struct Stats {
     pub frames: u64,
-    /// Frames whose lines disagreed on their width, or that had no lines.
+    /// Frames whose lines disagreed on their width, that had no lines, or
+    /// whose geometry matched neither the current format nor a new one seen
+    /// twice in a row (a frame that lost lines to a USB drop).
     pub bad_frames: u64,
     pub audio_blocks: u64,
     pub unknown_blocks: u64,
@@ -101,6 +103,7 @@ pub struct Assembler {
     line_bytes: Option<usize>,
     consistent: bool,
     last_geometry: Option<(usize, usize)>,
+    candidate: Option<(usize, usize)>,
     pub stats: Stats,
 }
 
@@ -121,6 +124,7 @@ impl Assembler {
             line_bytes: None,
             consistent: true,
             last_geometry: None,
+            candidate: None,
             stats: Stats::default(),
         }
     }
@@ -146,11 +150,23 @@ impl Assembler {
     fn finish_frame(&mut self, emit: &mut impl FnMut(Event)) {
         let width = self.line_bytes.unwrap_or(0) / 2;
         let height = self.active_lines;
-        if self.consistent && width > 0 && height > 0 {
-            let geometry = (width, height);
-            if self.last_geometry.is_some_and(|last| last != geometry) {
+        let geometry = (width, height);
+        // A geometry that differs from the current one is accepted only when
+        // it shows up twice in a row; a single odd frame has lost lines.
+        let accepted = match self.last_geometry {
+            None => true,
+            Some(last) if last == geometry => true,
+            Some(_) if self.candidate == Some(geometry) => {
                 self.stats.format_changes += 1;
+                true
             }
+            Some(_) => {
+                self.candidate = Some(geometry);
+                false
+            }
+        };
+        if self.consistent && width > 0 && height > 0 && accepted {
+            self.candidate = None;
             self.last_geometry = Some(geometry);
             self.stats.frames += 1;
             let pixels = std::mem::take(&mut self.frame);
@@ -334,14 +350,33 @@ mod tests {
         let mut assembler = Assembler::new();
         let mut seen = Vec::new();
         let mut data = stream(1280, 720, 30, 2);
-        data.extend(stream(720, 576, 49, 2));
+        data.extend(stream(720, 576, 49, 3));
         assembler.push(&data, |event| {
             if let Event::Frame(frame) = event {
                 seen.push((frame.width, frame.height));
             }
         });
+        // The first 576p frame is held back as a candidate; the second confirms it.
         assert_eq!(seen, vec![(1280, 720), (1280, 720), (720, 576)]);
         assert_eq!(assembler.stats.format_changes, 1);
+        assert_eq!(assembler.stats.bad_frames, 1);
+    }
+
+    #[test]
+    fn a_single_short_frame_is_rejected_not_a_format_change() {
+        let mut data = stream(1920, 1080, 45, 2);
+        data.extend(stream(1920, 1060, 45, 1)); // lost lines
+        data.extend(stream(1920, 1080, 45, 2));
+        let mut assembler = Assembler::new();
+        let mut seen = Vec::new();
+        assembler.push(&data, |event| {
+            if let Event::Frame(frame) = event {
+                seen.push(frame.height);
+            }
+        });
+        assert!(seen.iter().all(|&h| h == 1080), "{seen:?}");
+        assert_eq!(assembler.stats.format_changes, 0);
+        assert_eq!(assembler.stats.bad_frames, 1);
     }
 
     #[test]
