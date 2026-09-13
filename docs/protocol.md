@@ -217,9 +217,31 @@ private (they contain the serial and captured video).
   "HD60 S". The EDID the box presents to the HDMI source is therefore writable.
 - **Interrupt endpoint `0x81` carried no data at any point**, not even with the
   official application streaming.
-- **The light strip stayed off throughout** — after PnP, while streaming, and
-  during the `0x13` pulse. Either none of this drives it or the strip on this
-  unit is dead.
+- **The light strip is driven by the firmware, not by the host.** It is an
+  RGB strip: at power-on it blinks red twice and then white, it lights red
+  while no HDMI signal is present, and it stayed off with the driver loaded
+  and while the application streamed. Replaying the driver's writes from Linux
+  (`0x13` := `80 81 80 80`, and `0x3b` := `80` followed by `0x10` := `01`)
+  changed nothing visible.
+
+### Bank `0x64` registers `0x00`–`0x1f`: the input timing
+
+The 32-byte read the driver polls is a window on registers `0x00`–`0x1f`
+of bank `0x64` (a write to `0x10` shows up at byte 16). Bytes 4–11 hold the
+detected input timing as little-endian 16-bit words; with a 1080p60 source:
+
+```text
+00 00 00 00 | 65 04 | 98 08 | 38 04 | 80 07 | 3c 12 30 00 | 00 00 80 80 80 80 80 00 ...
+              1125    2200    1080    1920    60 ...
+              total   total   active  active  Hz
+              lines   pixels  lines   pixels
+```
+
+Unplugging the HDMI cable zeroes bytes 4–12 within the 100 ms poll interval;
+plugging it back restores them about nine seconds later. `hd60s-linux signal
+[SECONDS]` reads and watches this. Bytes 13 (`0x12`) and 14 (`0x30`) did not
+change with the signal; their meaning is open. The bulk stream survived the
+unplug; the feeder service did not need a restart.
 
 ### Still open
 

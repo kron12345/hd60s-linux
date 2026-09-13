@@ -34,6 +34,13 @@ v4l2loopback device and audio into a PipeWire sink; `tools/hd60s-obs.service`
 keeps it running as a systemd user unit. See `docs/protocol.md` for the
 module options.
 
+Read the detected HDMI input timing, or watch it for a while:
+
+```bash
+cargo run --release -- signal      # once
+cargo run --release -- signal 60   # watch, print changes
+```
+
 ## USB characterization
 
 The `hd60s-linux` binary locates the device and prints its configurations,

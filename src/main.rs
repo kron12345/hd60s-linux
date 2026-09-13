@@ -30,6 +30,8 @@ fn hd60s_revision(vendor_id: u16, product_id: u16) -> Option<&'static str> {
 const REGISTER_REQUEST: u8 = 0xc0;
 const HDMI_REGISTER_BANK: u16 = 0x0098;
 const STARTUP_STATUS_REGISTER: u16 = 0x003b;
+/// Rev. 4 register bank the official driver polls for the input timing.
+const SIGNAL_REGISTER_BANK: u16 = 0x0064;
 
 fn transfer_name(transfer_type: TransferType) -> &'static str {
     match transfer_type {
@@ -338,6 +340,61 @@ fn capture<T: UsbContext + 'static>(
     Ok(())
 }
 
+/// Reads bank 0x64 registers 0x00..0x1f the way the official driver polls them
+/// every 105 ms, and prints the detected input timing. With `seconds`, keeps
+/// watching and prints only changes.
+fn read_signal<T: UsbContext>(device: Device<T>, seconds: Option<u64>) -> Result<(), String> {
+    let handle = device
+        .open()
+        .map_err(|error| format!("opening device: {error}"))?;
+    // Vendor/device form as seen on the wire; no interface claim is needed.
+    let request_type = rusb::request_type(Direction::In, RequestType::Vendor, Recipient::Device);
+    let mut registers = [0_u8; 32];
+    let mut previous: Option<[u8; 32]> = None;
+    let started = Instant::now();
+    loop {
+        let length = handle
+            .read_control(
+                request_type,
+                REGISTER_REQUEST,
+                SIGNAL_REGISTER_BANK,
+                0,
+                &mut registers,
+                Duration::from_secs(1),
+            )
+            .map_err(|error| format!("reading bank 0x64 registers: {error}"))?;
+        if length != registers.len() {
+            return Err(format!("expected 32 bytes, got {length}"));
+        }
+        if previous != Some(registers) {
+            let word = |at: usize| u16::from_le_bytes([registers[at], registers[at + 1]]);
+            let (total_lines, total_pixels) = (word(4), word(6));
+            let (height, width) = (word(8), word(10));
+            let raw = registers
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if width == 0 && height == 0 {
+                println!("no signal  [{raw}]");
+            } else {
+                println!(
+                    "{width}x{height} active, {total_pixels}x{total_lines} total, {} Hz  [{raw}]",
+                    registers[12]
+                );
+            }
+            previous = Some(registers);
+        }
+        match seconds {
+            Some(limit) if started.elapsed() < Duration::from_secs(limit) => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
 fn read_direct_startup_status<T: UsbContext>(device: Device<T>) -> Result<(), String> {
     let handle = device
         .open()
@@ -376,6 +433,7 @@ enum Operation {
     ObserveInterrupt(u64),
     ObserveStream(u64),
     Capture(Option<u64>, Option<String>),
+    Signal(Option<u64>),
     Status,
 }
 
@@ -399,6 +457,7 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
                 Operation::Capture(seconds, ref audio) => {
                     return capture(device, seconds, audio.as_deref());
                 }
+                Operation::Signal(seconds) => return read_signal(device, seconds),
                 Operation::Status => return read_direct_startup_status(device),
                 Operation::Inspect => {}
             }
@@ -444,6 +503,12 @@ fn main() -> ExitCode {
                 None => Ok(Operation::Capture(None, audio)),
             }
         }
+        Some("signal") => match arguments.get(1) {
+            Some(value) => value
+                .parse::<u64>()
+                .map(|seconds| Operation::Signal(Some(seconds))),
+            None => Ok(Operation::Signal(None)),
+        },
         Some("status") => Ok(Operation::Status),
         _ => Ok(Operation::Inspect),
     };
@@ -451,7 +516,7 @@ fn main() -> ExitCode {
         Ok(operation) => operation,
         Err(_) => {
             eprintln!(
-                "error: usage: hd60s-linux [status|observe|observe-stream|capture] \
+                "error: usage: hd60s-linux [status|signal|observe|observe-stream|capture] \
                  [SECONDS] [--audio FILE]"
             );
             return ExitCode::FAILURE;
