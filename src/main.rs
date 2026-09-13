@@ -33,7 +33,7 @@ const HDMI_REGISTER_BANK: u16 = 0x0098;
 const STARTUP_STATUS_REGISTER: u16 = 0x003b;
 /// Rev. 4 register bank the official driver polls for the input timing.
 const SIGNAL_REGISTER_BANK: u16 = 0x0064;
-/// Bank 0x64 register for the HDMI colour range: 0 = standard, 1 = expanded.
+/// Bank 0x64 register for the colour range conversion: 0 bypass, 1 shrink, 2 expand.
 const COLOUR_RANGE_REGISTER: u16 = 0x0012;
 /// Bank 0x64 register holding brightness, contrast, saturation and hue,
 /// one byte each with 0x80 as neutral.
@@ -890,8 +890,9 @@ fn picture<T: UsbContext>(device: Device<T>, settings: PictureSettings) -> Resul
     println!(
         "colour range: {} ({range:#04x})",
         match range {
-            0 => "standard",
-            1 => "expanded",
+            0 => "bypass",
+            1 => "shrink (the application calls this expanded)",
+            2 => "expand",
             _ => "unset (power-on default)",
         }
     );
@@ -1063,8 +1064,9 @@ fn parse_picture(arguments: &[String]) -> Result<PictureSettings, std::num::Pars
             "--reset" => settings.reset = true,
             "--range" => {
                 settings.range = Some(match iter.next().map(String::as_str) {
-                    Some("standard" | "limited") => 0,
-                    Some("expanded" | "full") => 1,
+                    Some("bypass" | "standard") => 0,
+                    Some("shrink" | "expanded") => 1,
+                    Some("expand") => 2,
                     other => other.unwrap_or("").parse::<u8>()?,
                 })
             }
@@ -1149,7 +1151,7 @@ fn main() -> ExitCode {
         Err(_) => {
             eprintln!(
                 "error: usage: hd60s-linux [status|signal|picture|audio|edid|mcu|observe|observe-stream|observe-iso|capture] \\
-                 [SECONDS] [--audio FILE] [--native]\n       picture [--range standard|expanded] \\
+                 [SECONDS] [--audio FILE] [--native]\n       picture [--range bypass|shrink|expand] \\
                  [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]"
             );
             return ExitCode::FAILURE;

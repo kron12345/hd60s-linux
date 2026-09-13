@@ -217,9 +217,11 @@ private (they contain the serial and captured video).
   each setting of the Game Capture HD application one at a time):
   - `0x10`: stream on (`01`) / off (`00`). Every profile or frame-rate change
     in the application is just a stop and a start of the stream.
-  - `0x12`: HDMI colour range, `00` = standard (limited), `01` = expanded
-    (full). The "Input Device" presets only set this: PC → `01`,
-    PlayStation 4 → `00`, the Xbox presets leave it alone.
+  - `0x12`: colour range conversion — per the analysis in dougg3's kernel
+    driver `0` = bypass, `1` = shrink, `2` = expand (the receiver clamps luma
+    at 235 regardless, so expand cannot reach full range). The application's
+    "Expanded" setting and its "PC" preset write `1`; "Standard" and the
+    PlayStation preset write `0`; the Xbox presets leave it alone.
   - `0x13`: four picture controls, one byte each — brightness, contrast,
     saturation, hue — with `80` as neutral. "Brightness up" wrote
     `86 80 80 80`, "Reset Defaults" `80 80 80 80`. The `80 81 80 80` written
@@ -266,9 +268,13 @@ image that ships with the Windows application; the image itself is not part
 of this repository, and the unit at hand runs a different firmware build, so
 the command is avoided on the assumption that the entry point is shared.)
 
-The light strip is driven by that microcontroller (two channels: PA4+PA6 and
-PC7) and, in normal operation, never switched on by its firmware; there is no
-USB command for it.
+There is no USB command for the light strip; see the note on it above.
+
+A complete kernel driver for all four revisions exists in
+[dougg3/hd60s-linux-driver](https://github.com/dougg3/hd60s-linux-driver)
+(V4L2 + ALSA, interlaced input, picture controls). For end users that is the
+better path; the findings here complement it (EDID access, audio gain, the
+MCU commands, and the measurements above).
   - `hd60s-linux picture` reads and writes these two registers from Linux
     with the same requests. **These controls also change the picture on the
     HDMI pass-through output** (observed on a monitor attached to it): the
@@ -280,8 +286,14 @@ USB command for it.
   back, then writes a version with the monitor name changed from "Elgato" to
   "HD60 S". The EDID the box presents to the HDMI source is therefore writable.
 - **Interrupt endpoint `0x81` carried no data at any point**, not even with the
-  official application streaming.
-- **The light strip is driven by the firmware, not by the host.** It is an
+  official application streaming. dougg3's driver identifies request `0xc6`
+  with `wIndex 0x0100` from the PnP sequence as *disarming* the device's
+  event reporting, which explains the silence.
+- **The light strip is driven by the firmware, not by the host.** Doug Brown's
+  2024 write-up on repairing an HD60 S found the strip behind an IT1504 LED
+  driver controlled by the Nuvoton M031 MCU, with the animation data stored
+  at offset 0x300000 of the SPI flash; on many units that region is empty and
+  the MCU then never initialises the strip. That matches this unit. It is an
   RGB strip: at power-on it blinks red twice and then white, it lights red
   while no HDMI signal is present, and it stayed off with the driver loaded
   and while the application streamed. Replaying the driver's writes from Linux

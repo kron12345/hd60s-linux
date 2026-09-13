@@ -52,7 +52,7 @@ register writes the official application makes (bank `0x64`, registers
 
 ```bash
 cargo run --release -- picture
-cargo run --release -- picture --range expanded --brightness 150
+cargo run --release -- picture --range bypass --brightness 150
 cargo run --release -- picture --reset
 ```
 
