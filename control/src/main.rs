@@ -26,13 +26,17 @@ fn socket_path() -> PathBuf {
 
 /// One HTTP request over the Unix socket; returns status and body.
 fn api(method: &str, path: &str) -> Result<(u16, Vec<u8>), String> {
-    let mut stream = UnixStream::connect(socket_path())
-        .map_err(|error| format!("service not reachable ({error}); is `hd60s-serve.service` running?"))?;
+    let mut stream = UnixStream::connect(socket_path()).map_err(|error| {
+        format!("service not reachable ({error}); is `hd60s-serve.service` running?")
+    })?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| e.to_string())?;
     stream
-        .write_all(format!("{method} {path} HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n").as_bytes())
+        .write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
         .map_err(|e| e.to_string())?;
     let mut data = Vec::new();
     stream.read_to_end(&mut data).map_err(|e| e.to_string())?;
@@ -69,25 +73,84 @@ fn post(path: &str) -> String {
     }
 }
 
-/// BT.709 limited range, integer arithmetic.
-fn yuyv_to_rgb(frame: &[u8]) -> SharedPixelBuffer<Rgb8Pixel> {
-    let mut buffer = SharedPixelBuffer::<Rgb8Pixel>::new(WIDTH as u32, HEIGHT as u32);
+/// BT.709 limited range, integer arithmetic; `factor` > 1 averages
+/// factor x factor source pixels (a box filter), which is what keeps the
+/// scaled picture free of moiré.
+fn yuyv_to_rgb(frame: &[u8], factor: usize) -> SharedPixelBuffer<Rgb8Pixel> {
+    let (w, h) = (WIDTH / factor, HEIGHT / factor);
+    let mut buffer = SharedPixelBuffer::<Rgb8Pixel>::new(w as u32, h as u32);
     let pixels = buffer.make_mut_slice();
-    for (i, quad) in frame.as_chunks::<4>().0.iter().enumerate() {
-        let (y0, u, y1, v) = (quad[0] as i32, quad[1] as i32 - 128, quad[2] as i32 - 128, quad[3] as i32 - 128);
-        let r_add = (459 * v) >> 8;
-        let g_add = -((55 * u + 136 * v) >> 8);
-        let b_add = (541 * u) >> 8;
-        for (k, y) in [y0, y1].into_iter().enumerate() {
-            let luma = (298 * (y - 16)) >> 8;
-            pixels[i * 2 + k] = Rgb8Pixel {
-                r: (luma + r_add).clamp(0, 255) as u8,
-                g: (luma + g_add).clamp(0, 255) as u8,
-                b: (luma + b_add).clamp(0, 255) as u8,
+    let samples = (factor * factor) as i32;
+    for y in 0..h {
+        for x in 0..w {
+            let (mut sy, mut su, mut sv) = (0_i32, 0_i32, 0_i32);
+            for dy in 0..factor {
+                let row = &frame[(y * factor + dy) * WIDTH * 2..];
+                for dx in 0..factor {
+                    let sx = x * factor + dx;
+                    let pair = (sx / 2) * 4;
+                    sy += row[pair + if sx.is_multiple_of(2) { 0 } else { 2 }] as i32;
+                    su += row[pair + 1] as i32;
+                    sv += row[pair + 3] as i32;
+                }
+            }
+            let (yv, u, v) = (sy / samples, su / samples - 128, sv / samples - 128);
+            let luma = (298 * (yv - 16)) >> 8;
+            pixels[y * w + x] = Rgb8Pixel {
+                r: (luma + ((459 * v) >> 8)).clamp(0, 255) as u8,
+                g: (luma - ((55 * u + 136 * v) >> 8)).clamp(0, 255) as u8,
+                b: (luma + ((541 * u) >> 8)).clamp(0, 255) as u8,
             };
         }
     }
     buffer
+}
+
+/// `systemctl --user` for the service.
+fn systemctl(args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .arg("hd60s-serve.service")
+        .output()
+        .map_err(|e| format!("systemctl: {e}"))?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() || args[0].starts_with("is-") {
+        Ok(text)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// The service run by this program when systemd is not running it.
+struct OwnService(std::process::Child);
+
+impl Drop for OwnService {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn start_own_service() -> Result<OwnService, String> {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new("hd60s-linux");
+    command
+        .args(["serve", "--tray", "off"])
+        .stdin(std::process::Stdio::null());
+    // SAFETY: prctl only marks the child to receive SIGTERM when this
+    // process dies, however it dies — the service must never outlive the
+    // program that started it.
+    unsafe {
+        command.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    command
+        .spawn()
+        .map(OwnService)
+        .map_err(|e| format!("starting hd60s-linux serve: {e}"))
 }
 
 fn text(v: &Value, key: &str) -> String {
@@ -151,7 +214,9 @@ fn apply_state(ui: &MainWindow, s: &Value) {
             ui.set_saturation(get(2));
             ui.set_hue(get(3));
             ui.set_gain(settings["gain"].as_i64().unwrap_or(128) as i32);
-            ui.set_gain_db(format!("{:+.1} dB", settings["gain_db"].as_f64().unwrap_or(0.0)).into());
+            ui.set_gain_db(
+                format!("{:+.1} dB", settings["gain_db"].as_f64().unwrap_or(0.0)).into(),
+            );
             ui.set_range_index(settings["range"].as_i64().unwrap_or(0).min(2) as i32);
         }
     } else {
@@ -163,8 +228,16 @@ fn apply_state(ui: &MainWindow, s: &Value) {
             format!(
                 "{} — {}{}",
                 text(edid, "summary"),
-                if edid["valid"].as_bool().unwrap_or(false) { "valid" } else { "INVALID" },
-                if edid["factory"].as_bool().unwrap_or(false) { ", power-on block" } else { ", custom" }
+                if edid["valid"].as_bool().unwrap_or(false) {
+                    "valid"
+                } else {
+                    "INVALID"
+                },
+                if edid["factory"].as_bool().unwrap_or(false) {
+                    ", power-on block"
+                } else {
+                    ", custom"
+                }
             )
         } else {
             String::new()
@@ -174,7 +247,14 @@ fn apply_state(ui: &MainWindow, s: &Value) {
     if let Some(mcu) = s["mcu"].as_array() {
         ui.set_mcu_text(
             mcu.iter()
-                .map(|m| format!("{} {}: {}", text(m, "command"), text(m, "meaning"), text(m, "reply")))
+                .map(|m| {
+                    format!(
+                        "{} {}: {}",
+                        text(m, "command"),
+                        text(m, "meaning"),
+                        text(m, "reply")
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
                 .into(),
@@ -194,7 +274,11 @@ fn apply_state(ui: &MainWindow, s: &Value) {
                 rec["dropped"]
             )
         } else {
-            format!("off · files go to {} · encoder {}", text(s, "record_dir"), text(s, "encoder"))
+            format!(
+                "off · files go to {} · encoder {}",
+                text(s, "record_dir"),
+                text(s, "encoder")
+            )
         }
         .into(),
     );
@@ -221,6 +305,67 @@ fn apply_state(ui: &MainWindow, s: &Value) {
 fn main() -> Result<(), slint::PlatformError> {
     let ui = MainWindow::new()?;
     let busy = Arc::new(AtomicBool::new(false));
+    // Downscaling factor for the preview, chosen from the widget's width.
+    let factor = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+    let own: Arc<std::sync::Mutex<Option<OwnService>>> = Arc::new(std::sync::Mutex::new(None));
+
+    // Service control: the systemd unit or, without it, our own child.
+    {
+        let own = own.clone();
+        let weak = ui.as_weak();
+        ui.on_toggle_autostart(move |on| {
+            let own = own.clone();
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let result = if on {
+                    own.lock().unwrap().take();
+                    systemctl(&["unmask"]).and_then(|_| systemctl(&["enable", "--now"]))
+                } else {
+                    systemctl(&["disable", "--now"]).and_then(|_| systemctl(&["mask"]))
+                };
+                let message = match result {
+                    Ok(_) if on => "service enabled: starts with the card and at login".to_string(),
+                    Ok(_) => "service disabled and masked: runs only while this program is open"
+                        .to_string(),
+                    Err(error) => error,
+                };
+                let _ = weak.upgrade_in_event_loop(move |ui| ui.set_message(message.into()));
+            });
+        });
+    }
+    {
+        let own = own.clone();
+        let weak = ui.as_weak();
+        ui.on_toggle_service(move || {
+            let own = own.clone();
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let running = state().is_ok();
+                let message = if running {
+                    if own.lock().unwrap().take().is_some() {
+                        "service stopped".to_string()
+                    } else {
+                        systemctl(&["stop"])
+                            .map(|_| "service stopped".to_string())
+                            .unwrap_or_else(|e| e)
+                    }
+                } else if systemctl(&["is-enabled"]).as_deref() == Ok("enabled") {
+                    systemctl(&["start"])
+                        .map(|_| "service started".to_string())
+                        .unwrap_or_else(|e| e)
+                } else {
+                    match start_own_service() {
+                        Ok(child) => {
+                            *own.lock().unwrap() = Some(child);
+                            "service started by this program".to_string()
+                        }
+                        Err(error) => error,
+                    }
+                };
+                let _ = weak.upgrade_in_event_loop(move |ui| ui.set_message(message.into()));
+            });
+        });
+    }
 
     // Actions: each request on its own thread, then a state refresh.
     let act = |ui: &MainWindow, path: String| {
@@ -259,7 +404,11 @@ fn main() -> Result<(), slint::PlatformError> {
         let ui_handle = ui.as_weak();
         ui.on_toggle_record(move || {
             let ui = ui_handle.unwrap();
-            let path = if ui.get_recording() { "/api/record?stop=1" } else { "/api/record?start=1" };
+            let path = if ui.get_recording() {
+                "/api/record?stop=1"
+            } else {
+                "/api/record?start=1"
+            };
             act(&ui, path.into());
         });
     }
@@ -267,7 +416,11 @@ fn main() -> Result<(), slint::PlatformError> {
         let ui_handle = ui.as_weak();
         ui.on_toggle_stream(move || {
             let ui = ui_handle.unwrap();
-            let path = if ui.get_stream_on() { "/api/stream?off=1" } else { "/api/stream?on=1" };
+            let path = if ui.get_stream_on() {
+                "/api/stream?off=1"
+            } else {
+                "/api/stream?on=1"
+            };
             act(&ui, path.into());
         });
     }
@@ -289,12 +442,49 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // State once a second.
+    // State once a second; the service's systemd status every fifth time.
     {
         let weak = ui.as_weak();
+        let own = own.clone();
         std::thread::spawn(move || {
+            let mut tick = 0_u32;
+            let mut tried_own = false;
             loop {
                 let result = state();
+                if result.is_err() && !tried_own && own.lock().unwrap().is_none() {
+                    // Nothing answers: unless systemd is meant to run it, run it ourselves.
+                    tried_own = true;
+                    let enabled = systemctl(&["is-enabled"]).unwrap_or_default();
+                    if enabled != "enabled"
+                        && let Ok(child) = start_own_service()
+                    {
+                        *own.lock().unwrap() = Some(child);
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                }
+                if tick.is_multiple_of(5) {
+                    let enabled = systemctl(&["is-enabled"]).unwrap_or_default();
+                    let active = systemctl(&["is-active"]).unwrap_or_default() == "active";
+                    let own_running = own.lock().unwrap().is_some();
+                    let text = match (active, own_running, result.is_ok()) {
+                        (true, _, _) => "running as systemd user service".to_string(),
+                        (false, true, true) => {
+                            "running, started by this program (ends with it)".to_string()
+                        }
+                        (false, true, false) => "starting…".to_string(),
+                        (false, false, true) => "running elsewhere".to_string(),
+                        (false, false, false) => format!("not running (unit {enabled})"),
+                    };
+                    let autostart = enabled == "enabled";
+                    let running = result.is_ok();
+                    let _ = weak.upgrade_in_event_loop(move |ui| {
+                        ui.set_service_text(text.into());
+                        ui.set_autostart(autostart);
+                        ui.set_service_running(running);
+                    });
+                }
+                tick += 1;
                 let done = weak
                     .upgrade_in_event_loop(move |ui| match &result {
                         Ok(s) => apply_state(&ui, s),
@@ -317,6 +507,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = ui.as_weak();
         let busy = busy.clone();
+        let factor = factor.clone();
         std::thread::spawn(move || {
             let mut last_len = 0;
             loop {
@@ -326,12 +517,20 @@ fn main() -> Result<(), slint::PlatformError> {
                     && frame.len() == WIDTH * HEIGHT * 2
                 {
                     last_len = frame.len();
-                    let rgb = yuyv_to_rgb(&frame);
+                    let rgb = yuyv_to_rgb(&frame, factor.load(Ordering::Relaxed).max(1));
                     busy.store(true, Ordering::Relaxed);
                     let busy_done = busy.clone();
+                    let factor_out = factor.clone();
                     if weak
                         .upgrade_in_event_loop(move |ui| {
                             ui.set_preview(Image::from_rgb8(rgb));
+                            // Full size only when the widget can show it.
+                            let wanted = if ui.get_preview_width() >= 1500.0 {
+                                1
+                            } else {
+                                2
+                            };
+                            factor_out.store(wanted, Ordering::Relaxed);
                             busy_done.store(false, Ordering::Relaxed);
                         })
                         .is_err()
@@ -348,5 +547,8 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    ui.run()
+    let result = ui.run();
+    // Our own service, if any, ends with the program.
+    own.lock().unwrap().take();
+    result
 }

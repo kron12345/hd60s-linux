@@ -82,9 +82,10 @@ below offers the same over HTTP for remote or scripted use.
 
 ### Control panel
 
-While `serve` runs it also serves a control panel on
-<http://127.0.0.1:8060/> (`--panel ADDR` moves it, `--panel off` disables
-it; it is bound to localhost and has no authentication). The page shows
+With `--panel on` (or `--panel ADDR`) `serve` also serves a web version of
+the control program on <http://127.0.0.1:8060/> — off by default now that
+the native program exists; useful for scripts or a browser on another
+machine through an SSH tunnel. The page shows
 everything the card exposes and lets you change what can be changed:
 
 - a live preview of the captured picture, the detected input timing and the
