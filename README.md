@@ -71,6 +71,13 @@ Observe the device's interrupt endpoint without sending vendor commands:
 cargo run -- observe 10
 ```
 
+Stream the way the official application does — isochronous alternate
+setting 2 after the register writes it makes — and dump the first 64 MB:
+
+```bash
+cargo run --release -- observe-iso 10
+```
+
 Perform a bounded read of the advertised bulk stream alternate setting:
 
 ```bash

@@ -400,6 +400,178 @@ fn capture<T: UsbContext + 'static>(
     Ok(())
 }
 
+/// Shared state of the isochronous reader: byte counter and a bounded dump.
+struct IsoState {
+    bytes: u64,
+    packets: u64,
+    dump: Vec<u8>,
+    dump_limit: usize,
+}
+
+extern "system" fn iso_callback(transfer: *mut libusb1_sys::libusb_transfer) {
+    // SAFETY: the transfer and its user data were created in `observe_iso`
+    // and stay alive until every transfer has been freed there.
+    unsafe {
+        let state = &mut *((*transfer).user_data as *mut IsoState);
+        let packets = (*transfer).num_iso_packets as usize;
+        let mut offset = 0_usize;
+        for i in 0..packets {
+            let desc = &*(*transfer).iso_packet_desc.as_ptr().add(i);
+            let got = desc.actual_length as usize;
+            if got > 0 {
+                state.bytes += got as u64;
+                state.packets += 1;
+                if state.dump.len() < state.dump_limit {
+                    let take = got.min(state.dump_limit - state.dump.len());
+                    state.dump.extend_from_slice(std::slice::from_raw_parts(
+                        (*transfer).buffer.add(offset),
+                        take,
+                    ));
+                }
+            }
+            offset += desc.length as usize;
+        }
+        if (*transfer).status == libusb1_sys::constants::LIBUSB_TRANSFER_CANCELLED {
+            return;
+        }
+        libusb1_sys::libusb_submit_transfer(transfer);
+    }
+}
+
+/// Streams the way the official application does: bank 0x64 register 0x3b
+/// := 0x80, register 0x10 := 0x01, alternate setting 2, isochronous reads
+/// from endpoint 0x83. Reports the throughput and dumps the first 64 MB to
+/// /tmp/hd60s-iso.bin, then stops the stream again (alternate setting 0,
+/// register 0x10 := 0x00).
+fn observe_iso<T: UsbContext>(context: &T, device: Device<T>, seconds: u64) -> Result<(), String> {
+    const PACKET: usize = 32 * 1024; // 1024 x burst 16 x mult 2 per interval
+    const PACKETS: usize = 32;
+    const TRANSFERS: usize = 8;
+
+    let handle = device
+        .open()
+        .map_err(|error| format!("opening device: {error}"))?;
+    handle
+        .claim_interface(0)
+        .map_err(|error| format!("claiming interface 0: {error}"))?;
+    let write_type = rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Device);
+    let timeout = Duration::from_secs(1);
+    let write = |register: u16, data: &[u8]| {
+        handle
+            .write_control(
+                write_type,
+                REGISTER_REQUEST,
+                SIGNAL_REGISTER_BANK,
+                register,
+                data,
+                timeout,
+            )
+            .map(|_| ())
+            .map_err(|error| format!("writing bank 0x64 register {register:#04x}: {error}"))
+    };
+    write(0x3b, &[0x80])?;
+    write(0x10, &[0x01])?;
+    eprintln!("stage: bank 0x64 register 0x3b := 80, register 0x10 := 01");
+    handle
+        .set_alternate_setting(0, 2)
+        .map_err(|error| format!("selecting alternate setting 2: {error}"))?;
+    eprintln!("stage: alternate setting 2 (isochronous) selected, streaming {seconds} s");
+
+    let mut state = Box::new(IsoState {
+        bytes: 0,
+        packets: 0,
+        dump: Vec::new(),
+        dump_limit: 64 << 20,
+    });
+    let mut buffers: Vec<Vec<u8>> = (0..TRANSFERS)
+        .map(|_| vec![0_u8; PACKET * PACKETS])
+        .collect();
+    let mut transfers = Vec::with_capacity(TRANSFERS);
+    // SAFETY: plain libusb asynchronous API; every pointer handed to libusb
+    // outlives the transfers, which are cancelled and freed below.
+    unsafe {
+        for buffer in buffers.iter_mut() {
+            let transfer = libusb1_sys::libusb_alloc_transfer(PACKETS as i32);
+            if transfer.is_null() {
+                return Err("allocating an isochronous transfer".into());
+            }
+            (*transfer).dev_handle = handle.as_raw();
+            (*transfer).endpoint = 0x83;
+            (*transfer).transfer_type = libusb1_sys::constants::LIBUSB_TRANSFER_TYPE_ISOCHRONOUS;
+            (*transfer).timeout = 1000;
+            (*transfer).buffer = buffer.as_mut_ptr();
+            (*transfer).length = buffer.len() as i32;
+            (*transfer).num_iso_packets = PACKETS as i32;
+            (*transfer).callback = iso_callback;
+            (*transfer).user_data = &mut *state as *mut IsoState as *mut std::ffi::c_void;
+            for i in 0..PACKETS {
+                (*(*transfer).iso_packet_desc.as_mut_ptr().add(i)).length = PACKET as u32;
+            }
+            let rc = libusb1_sys::libusb_submit_transfer(transfer);
+            if rc != 0 {
+                return Err(format!(
+                    "submitting an isochronous transfer: libusb error {rc}"
+                ));
+            }
+            transfers.push(transfer);
+        }
+        let started = Instant::now();
+        let mut reported = Instant::now();
+        while started.elapsed() < Duration::from_secs(seconds) {
+            let mut tv = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 100_000,
+            };
+            libusb1_sys::libusb_handle_events_timeout_completed(
+                context.as_raw(),
+                &mut tv,
+                std::ptr::null_mut(),
+            );
+            if reported.elapsed() >= Duration::from_secs(2) {
+                eprintln!(
+                    "{:.1} MB/s, {} packet(s) with data",
+                    state.bytes as f64 / started.elapsed().as_secs_f64() / 1e6,
+                    state.packets
+                );
+                reported = Instant::now();
+            }
+        }
+        for transfer in &transfers {
+            libusb1_sys::libusb_cancel_transfer(*transfer);
+        }
+        for _ in 0..10 {
+            let mut tv = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 100_000,
+            };
+            libusb1_sys::libusb_handle_events_timeout_completed(
+                context.as_raw(),
+                &mut tv,
+                std::ptr::null_mut(),
+            );
+        }
+        for transfer in transfers {
+            libusb1_sys::libusb_free_transfer(transfer);
+        }
+    }
+    handle
+        .set_alternate_setting(0, 0)
+        .map_err(|error| format!("selecting alternate setting 0: {error}"))?;
+    write(0x10, &[0x00])?;
+    eprintln!("stage: alternate setting 0, register 0x10 := 00");
+
+    let path = "/tmp/hd60s-iso.bin";
+    std::fs::write(path, &state.dump).map_err(|error| format!("writing {path}: {error}"))?;
+    println!(
+        "isochronous: {} byte(s) in {} packet(s), {:.1} MB/s, first {} byte(s) in {path}",
+        state.bytes,
+        state.packets,
+        state.bytes as f64 / seconds as f64 / 1e6,
+        state.dump.len()
+    );
+    Ok(())
+}
+
 /// Settings for the `picture` command; `None` leaves a value untouched.
 #[derive(Default, Clone)]
 struct PictureSettings {
@@ -591,6 +763,7 @@ enum Operation {
     Inspect,
     ObserveInterrupt(u64),
     ObserveStream(u64),
+    ObserveIso(u64),
     Capture(Option<u64>, Option<String>, bool),
     Signal(Option<u64>),
     Picture(PictureSettings),
@@ -614,6 +787,7 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
                         .map_err(|error| format!("observing HD60 S interrupt endpoint: {error}"));
                 }
                 Operation::ObserveStream(seconds) => return observe_stream(device, seconds),
+                Operation::ObserveIso(seconds) => return observe_iso(&context, device, seconds),
                 Operation::Capture(seconds, ref audio, native) => {
                     return capture(device, seconds, audio.as_deref(), native);
                 }
@@ -675,6 +849,7 @@ fn main() -> ExitCode {
     let operation = match arguments.first().map(String::as_str) {
         Some("observe") => seconds().map(Operation::ObserveInterrupt),
         Some("observe-stream") => seconds().map(Operation::ObserveStream),
+        Some("observe-iso") => seconds().map(Operation::ObserveIso),
         Some("capture") => {
             let audio = arguments
                 .iter()
@@ -706,7 +881,7 @@ fn main() -> ExitCode {
         Ok(operation) => operation,
         Err(_) => {
             eprintln!(
-                "error: usage: hd60s-linux [status|signal|picture|observe|observe-stream|capture] \\
+                "error: usage: hd60s-linux [status|signal|picture|observe|observe-stream|observe-iso|capture] \\
                  [SECONDS] [--audio FILE] [--native]\n       picture [--range standard|expanded] \\
                  [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]"
             );

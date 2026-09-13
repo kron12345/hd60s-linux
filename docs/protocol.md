@@ -208,7 +208,11 @@ private (they contain the serial and captured video).
   (isochronous). Video follows 38 ms later at about 250 URBs/s. **Stream stop**
   is the mirror image: alternate setting 0, then register `0x10` := `00`. The
   official path is therefore isochronous; the bulk path (alternate setting 4)
-  used by `capture` needs none of this and keeps working.
+  used by `capture` needs none of this and keeps working. Replayed from Linux
+  with `hd60s-linux observe-iso SECONDS` (libusb asynchronous isochronous
+  transfers, 32 packets of 32 KB per transfer, eight in flight): 259.6 MB/s,
+  8000 packets per second, and the data is framed exactly like the bulk
+  stream — same markers, same lines, same audio trailers.
 - **Bank `0x64` registers written by the application** (traced by changing
   each setting of the Game Capture HD application one at a time):
   - `0x10`: stream on (`01`) / off (`00`). Every profile or frame-rate change
