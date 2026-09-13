@@ -1,0 +1,21 @@
+# systemd user unit: publishes the HD60 S as a PipeWire camera and microphone.
+# No kernel module, no root — only the udev rule for device access.
+# Install to ~/.config/systemd/user/, adjust ExecStart, then
+#   systemctl --user enable --now hd60s-serve.service
+# For hot-plug start, pair it with a udev rule such as
+#   SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0fd9", \
+#     ATTR{idProduct}=="0076", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}="hd60s-serve.service"
+[Unit]
+Description=Elgato HD60 S as PipeWire camera and microphone
+After=pipewire.service wireplumber.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+ExecStart=%h/Projekte/hd60s-linux/target/release/hd60s-linux serve
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=5
+
+[Install]
+WantedBy=default.target

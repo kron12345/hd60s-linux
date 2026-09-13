@@ -15,6 +15,25 @@ stream data under the same sequence, so the other revisions are not yet
 confirmed to work. The protocol is documented from measurements, not guessed.
 Do not use this project for firmware updates.
 
+## Use it as a camera (PipeWire, no kernel module)
+
+```bash
+cargo run --release -- serve
+```
+
+publishes the device as a PipeWire camera **"Elgato HD60 S"** and a virtual
+microphone **"Elgato HD60 S Audio"**. OBS (Sources → Video Capture Device
+(PipeWire) and Audio Input Capture), browsers through the camera portal, and
+`gst-launch-1.0 pipewiresrc target-object="Elgato HD60 S"` see them like any
+camera. Nothing needs root: the udev rule below grants device access, and a
+kernel driver bound to the device is detached automatically. Frames are
+always 1920x1080 YUYV (smaller sources are centred on a black canvas), audio
+is 48 kHz stereo.
+
+`tools/hd60s-serve.service` runs it as a systemd user unit; `--name` changes
+the node names; `--from-file RAW [--fps N]` replays a recorded raw stream
+instead of the device, for development without hardware.
+
 ## Capturing (Rev. 4)
 
 Frames are written raw to stdout as YUYV 4:2:2. Whatever the source sends
@@ -34,9 +53,9 @@ transfers, and the outputs are written from their own threads: a consumer
 that stalls costs frames (counted in the periodic statistics) but never
 blocks the capture.
 
-For OBS, browsers and other V4L2 clients, `tools/hd60s-obs` feeds video into a
-v4l2loopback device and audio into a PipeWire sink; `tools/hd60s-obs.service`
-keeps it running as a systemd user unit. See `docs/protocol.md` for the
+Without PipeWire, `tools/hd60s-obs` feeds video into a v4l2loopback device
+(a kernel module) and audio into a PulseAudio/PipeWire sink instead;
+`tools/hd60s-obs.service` keeps it running. See `docs/protocol.md` for the
 module options.
 
 Read the detected HDMI input timing, or watch it for a while:

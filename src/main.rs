@@ -4,6 +4,8 @@ use std::{fs::File, io::Write};
 
 use hd60s_linux::edid;
 use hd60s_linux::frame::{self, Assembler, Event};
+use hd60s_linux::pump::Input;
+use hd60s_linux::serve::serve;
 use rusb::{
     Context, Device, DeviceDescriptor, Direction, Recipient, RequestType, TransferType, UsbContext,
 };
@@ -196,6 +198,9 @@ fn observe_stream<T: UsbContext>(device: Device<T>, seconds: u64) -> Result<(), 
     let handle = device
         .open()
         .map_err(|error| format!("opening device: {error}"))?;
+    // A kernel driver bound to the interface (for example hd60s.ko) is
+    // detached first; libusb rebinds nothing, so it stays off until a replug.
+    let _ = handle.set_auto_detach_kernel_driver(true);
     eprintln!("stage: claiming interface 0");
     handle
         .claim_interface(0)
@@ -249,6 +254,9 @@ fn capture<T: UsbContext + 'static>(
     let handle = device
         .open()
         .map_err(|error| format!("opening device: {error}"))?;
+    // A kernel driver bound to the interface (for example hd60s.ko) is
+    // detached first; libusb rebinds nothing, so it stays off until a replug.
+    let _ = handle.set_auto_detach_kernel_driver(true);
     handle
         .claim_interface(0)
         .map_err(|error| format!("claiming interface 0: {error}"))?;
@@ -473,6 +481,9 @@ fn observe_iso<T: UsbContext>(context: &T, device: Device<T>, seconds: u64) -> R
     let handle = device
         .open()
         .map_err(|error| format!("opening device: {error}"))?;
+    // A kernel driver bound to the interface (for example hd60s.ko) is
+    // detached first; libusb rebinds nothing, so it stays off until a replug.
+    let _ = handle.set_auto_detach_kernel_driver(true);
     handle
         .claim_interface(0)
         .map_err(|error| format!("claiming interface 0: {error}"))?;
@@ -967,6 +978,9 @@ fn read_direct_startup_status<T: UsbContext>(device: Device<T>) -> Result<(), St
     let handle = device
         .open()
         .map_err(|error| format!("opening device: {error}"))?;
+    // A kernel driver bound to the interface (for example hd60s.ko) is
+    // detached first; libusb rebinds nothing, so it stays off until a replug.
+    let _ = handle.set_auto_detach_kernel_driver(true);
     handle
         .claim_interface(0)
         .map_err(|error| format!("claiming interface 0: {error}"))?;
@@ -1007,6 +1021,7 @@ enum Operation {
     Audio(Option<u8>),
     Edid(EdidSettings),
     Mcu,
+    Serve { name: String },
     Status,
 }
 
@@ -1036,6 +1051,12 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
                 Operation::Audio(gain) => return audio(device, gain),
                 Operation::Edid(ref settings) => return edid_command(device, settings.clone()),
                 Operation::Mcu => return mcu(device),
+                Operation::Serve { ref name } => {
+                    let handle = device
+                        .open()
+                        .map_err(|error| format!("opening device: {error}"))?;
+                    return serve(name, Input::Usb(handle));
+                }
                 Operation::Status => return read_direct_startup_status(device),
                 Operation::Inspect => {}
             }
@@ -1143,16 +1164,46 @@ fn main() -> ExitCode {
             Ok(Operation::Edid(settings))
         }
         Some("mcu") => Ok(Operation::Mcu),
+        Some("serve") => Ok(Operation::Serve {
+            name: arguments
+                .iter()
+                .position(|argument| argument == "--name")
+                .and_then(|at| arguments.get(at + 1))
+                .cloned()
+                .unwrap_or_else(|| "Elgato HD60 S".to_string()),
+        }),
         Some("status") => Ok(Operation::Status),
         _ => Ok(Operation::Inspect),
     };
+    if arguments.first().map(String::as_str) == Some("serve") {
+        let option = |flag: &str| {
+            arguments
+                .iter()
+                .position(|argument| argument == flag)
+                .and_then(|at| arguments.get(at + 1))
+                .cloned()
+        };
+        if let Some(path) = option("--from-file") {
+            let fps = option("--fps")
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(60.0);
+            let name = option("--name").unwrap_or_else(|| "Elgato HD60 S".to_string());
+            return match serve::<Context>(&name, Input::File { path, fps }) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    }
     let operation = match operation {
         Ok(operation) => operation,
         Err(_) => {
             eprintln!(
-                "error: usage: hd60s-linux [status|signal|picture|audio|edid|mcu|observe|observe-stream|observe-iso|capture] \\
+                "error: usage: hd60s-linux [status|signal|picture|audio|edid|mcu|serve|observe|observe-stream|observe-iso|capture] \\
                  [SECONDS] [--audio FILE] [--native]\n       picture [--range bypass|shrink|expand] \\
-                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]"
+                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]\n       serve [--name NAME] [--from-file RAW [--fps N]]"
             );
             return ExitCode::FAILURE;
         }

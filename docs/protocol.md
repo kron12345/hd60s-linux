@@ -169,6 +169,19 @@ and OBS list the device but refuse to open it:
 options v4l2loopback devices=1 video_nr=10 card_label="Elgato HD60 S" exclusive_caps=1
 ```
 
+### PipeWire
+
+`hd60s-linux serve` publishes the capture through PipeWire: the video as a
+camera node (via the `pipewire-vircam` crate, which drives the node with its
+own clock), the audio as a virtual source that PipeWire itself creates
+(`support.null-audio-sink` with media class `Audio/Source/Virtual`) and that
+the tool feeds through a playback stream linked to it port by port. Two
+things learned on the way: a stream published directly as `Audio/Source` has
+no driver and is never scheduled, and the session manager links a playback
+stream only to a sink — asking for another target quietly lands on the
+default output. Recording from the virtual source works with its node name
+as target; PipeWire 1.6 ignores a numeric id there.
+
 ### In practice
 
 `hd60s-linux capture` writes the frames raw to stdout:
