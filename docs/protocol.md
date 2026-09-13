@@ -283,73 +283,63 @@ the command is avoided on the assumption that the entry point is shared.)
 
 There is no USB command for the light strip; see the note on it above.
 
-### Register access while streaming (measured 2026-09-13)
+### The plug-in sequence is required from power-on (measured 2026-09-13)
 
-The official driver keeps using the control endpoint while it streams: it
-polls bank `0x64` register `0x00` every 105 ms and writes the picture
-registers when the user moves a slider, all through the same device handle
-that owns the bulk pipe. Doing something similar from Linux with a *second*
-handle went wrong: while `serve` streamed on alternate setting 4, another
-process opened the device and issued an MCU proxy command (`0x5066`, write
-then read). The write went through, the read timed out, and from then on
-every vendor request — bank `0x64`, the EDID bank `0xa0` and the proxy —
-timed out or failed with an I/O error, even after the stream was stopped.
-A libusb device reset, the sysfs `authorized` toggle and a hub port
-`disable`/enable (which cut the SuperSpeed link but not VBUS on this root
-hub) did not help; the card came back at High Speed on the USB 2 pair once.
-Unbinding and rebinding the xHCI controller restored the SuperSpeed link
-and bank `0x64` reads, but selecting alternate setting 4 failed ("Other
-error") and the proxy stayed dead: the microcontroller had hung and only a
-physical replug (power cycle) recovers it. Whether the MCU proxy during
-streaming or any vendor request from a second handle is the trigger was not
-separated; both are avoided. The tools now:
+Every Linux measurement before this date was made on a card that the
+official driver had initialised earlier (during the Windows VM traces) and
+that had only been USB-reset since, never power-cycled. From a **true
+power-on state** the card behaves differently:
 
-- use one handle per process for streaming *and* register access
-  (`serve` and its panel share the handle, like the official driver);
-- refuse register access from the command line while another process holds
-  the streaming interface (claiming interface 0 detects that);
-- read the microcontroller and the EDID only before streaming; a panel EDID
-  write stops the stream, writes, and reattaches.
+- Standard requests and bank `0x64` reads work immediately.
+- The **first MCU proxy command (`0x5066`) without the plug-in sequence
+  hangs the card's USB controller**: the read times out, and from then on
+  every request on endpoint 0 — vendor requests, `GET_STATUS`, even
+  `GET_DESCRIPTOR` through usbfs — times out or fails with an I/O error,
+  while the HDMI side (EDID to the source, pass-through) keeps working.
+  A libusb reset, the sysfs `authorized` toggle, a hub-port disable, an
+  xHCI unbind/rebind, a PCI function reset and a PCI remove/rescan of the
+  controller do not help (this root hub cannot switch VBUS); only unplugging
+  the USB cable recovers it, and it then hangs again at the next bare proxy
+  command.
+- With the official driver's plug-in sequence sent first, the proxy works
+  as always (trace T04: after a plain replug, the Windows driver ran
+  `0xec` → `0xc1` → proxy → `0xc2`/`0xc7`/`0xc6` → register writes and got
+  `51 10 27` / `14 09 18` as usual). Replaying the same sequence from Linux
+  gives the same result.
 
-Bank `0x64` reads and writes through the streaming handle while data flows
-are what the official driver does; they are the only register traffic the
-panel makes during a stream.
+The sequence, sent verbatim by `Control::initialise` before anything else:
 
-A complete kernel driver for all four revisions exists in
-[dougg3/hd60s-linux-driver](https://github.com/dougg3/hd60s-linux-driver)
-(V4L2 + ALSA, interlaced input, picture controls). For end users that is the
-better path; the findings here complement it (EDID access, audio gain, the
-MCU commands, and the measurements above).
-  - `hd60s-linux picture` reads and writes these two registers from Linux
-    with the same requests. **These controls also change the picture on the
-    HDMI pass-through output** (observed on a monitor attached to it): the
-    pass-through is not an electrical loop-through but leaves the same
-    processing stage as the capture. Keep them neutral if someone plays on
-    the pass-through monitor and correct the picture downstream instead.
-- Before starting, the application reads the **EDID from bank `0xa0`**
-  (256 bytes as 16 reads of 16 bytes at `wIndex` 0, 16, … 240), writes it
-  back, then writes a version with the monitor name changed from "Elgato" to
-  "HD60 S". The EDID the box presents to the HDMI source is therefore writable.
-- **Interrupt endpoint `0x81` carried no data at any point**, not even with the
-  official application streaming. dougg3's driver identifies request `0xc6`
-  with `wIndex 0x0100` from the PnP sequence as *disarming* the device's
-  event reporting, which explains the silence.
-- **The light strip is driven by the firmware, not by the host.** Doug Brown's
-  2024 write-up on repairing an HD60 S found the strip behind an IT1504 LED
-  driver controlled by the Nuvoton M031 MCU, with the animation data stored
-  at offset 0x300000 of the SPI flash; on many units that region is empty and
-  the MCU then never initialises the strip. That matches this unit. It is an
-  RGB strip: at power-on it blinks red twice and then white, it lights red
-  while no HDMI signal is present, and it stayed off with the driver loaded
-  and while the application streamed. Replaying the driver's writes from Linux
-  (`0x13` := `80 81 80 80`, and `0x3b` := `80` followed by `0x10` := `01`)
-  changed nothing visible, and neither did streaming over the official
-  isochronous path with `observe-iso`. On this unit the strip never lights
-  in normal operation; whatever turns it white is not on the USB side.
-- Bank `0x64` read as a whole (registers `0x00`–`0x7f`): besides the timing
-  block and the registers above, `0x3b` and `0x3c` hold `80`, `0x3a` holds
-  `00`, and `0x7a`–`0x7e` echo the last MCU proxy command (`ab 03 12 34 58`
-  from the PnP sequence) — the bank exposes the mailbox to the MCU.
+| Request | wValue | wIndex | Data |
+|---|---|---|---|
+| OUT `0xec` | 0 | 0 | `b8 22 00 00 00 c0 00 00 50 ca` |
+| OUT `0xc1` | `0xc039` | 0 | – (stalls when already initialised; ignored) |
+| OUT `0xc1` | `0x4134` | 0 | – |
+| IN `0xc1` | `0x0039` | 0 | answers `01` |
+
+`0xc2`, `0xc7`/`0x0064` and `0xc6`/`0x0100` (dougg3: disarm event
+reporting) follow in the driver's sequence but were not needed for the
+proxy, the registers or streaming and are not sent.
+
+The reply buffer of the proxy keeps its previous content (`33 44 55` after
+power-on) until the microcontroller has answered, about 100 ms later, and
+the three bytes are updated one at a time (`14 10 27` was seen between
+`14 09 18` and `51 10 27`); a reader must wait and poll until two reads
+agree.
+
+### Register access while streaming
+
+The official driver keeps using the control endpoint while it streams —
+the 105 ms poll of bank `0x64` register `0x00` and the picture writes —
+through the same device handle that owns the bulk pipe. Doing the same from
+Linux through the streaming handle works (`serve` and its panel: timing and
+settings reads, picture/range/gain writes during a 1080p60 stream, no frame
+loss). The first attempt from a *second* handle in another process, which
+issued a bare proxy command, produced the hang described above; whether a
+second handle by itself is harmful was not separated from the missing
+plug-in sequence. The tools keep one handle per process, refuse register
+access from the command line while another process holds the streaming
+interface, read the microcontroller and the EDID only before streaming, and
+run the plug-in sequence on every open.
 
 ### Bank `0x64` registers `0x00`–`0x1f`: the input timing
 
@@ -410,5 +400,7 @@ size across source changes; `capture --native` writes frames at source size.
 - Meaning of interrupt endpoint `0x81`, which stayed silent even under the
   official driver and application.
 - Whether Rev. 1 to 3 stream without initialization as well.
-- Which request exactly hangs the microcontroller when issued next to a
-  stream from another handle (see above); until known, none is sent.
+- Whether register access from a second handle next to a stream is harmful
+  by itself (the hang seen on 2026-09-13 is explained by the missing plug-in
+  sequence; see above).
+- Meaning of the `0xec` payload and of requests `0xc2` and `0xc7`.

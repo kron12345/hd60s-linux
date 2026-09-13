@@ -23,6 +23,9 @@ pub const REG_STREAM: u16 = 0x10;
 pub const REG_COLOUR_RANGE: u16 = 0x12;
 pub const REG_PICTURE: u16 = 0x13;
 pub const REG_AUDIO_GAIN: u16 = 0x3b;
+/// Payload of request 0xec in the official driver's plug-in sequence;
+/// meaning unknown, sent unchanged.
+const INIT_PAYLOAD: [u8; 10] = [0xb8, 0x22, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x50, 0xca];
 
 /// Microcontroller commands that must never be sent: 0x60 turns the light
 /// strip on, unlocks the system registers, sets the boot-select bit and
@@ -128,7 +131,9 @@ impl Control {
             }
             Err(error) => return Err(format!("claiming interface 0: {error}")),
         }
-        Self::from_handle(Arc::new(handle), &device)
+        let control = Self::from_handle(Arc::new(handle), &device)?;
+        control.initialise()?;
+        Ok(control)
     }
 
     /// Wraps a handle that the caller already streams with.
@@ -159,6 +164,17 @@ impl Control {
             address: device.address(),
             serial,
         })
+    }
+
+    /// The plug-in sequence the official driver sends before anything else,
+    /// replayed verbatim: request 0xec with its fixed payload, 0xc1 with
+    /// 0xc039 and 0x4134, then 0xc1/0x0039 read back as 01. From a true
+    /// power-on state the microcontroller proxy does not work without it —
+    /// a bare proxy command then hangs the device's USB controller until the
+    /// next power cycle (measured 2026-09-13). The 0xc039 write may stall
+    /// when the device is already initialised; that is not an error.
+    pub fn initialise(&self) -> Result<(), String> {
+        initialise_handle(&self.handle)
     }
 
     /// Whether a kernel driver currently owns the streaming interface.
@@ -277,26 +293,27 @@ impl Control {
     }
 
     /// Sends one of the permitted MCU status commands and returns the reply.
+    ///
+    /// The reply buffer keeps its previous content until the microcontroller
+    /// has answered, roughly 100 ms later, and the bytes are updated one by
+    /// one — so the official driver's timing is followed: wait, then poll
+    /// until two reads 30 ms apart agree.
     pub fn mcu(&self, command: u8) -> Result<[u8; 3], String> {
         if MCU_FORBIDDEN.contains(&command) || !MCU_STATUS.iter().any(|(c, _)| *c == command) {
             return Err(format!("MCU command {command:#04x} is not permitted"));
         }
         self.write(MCU_PROXY, 0, &[0xab, 0x03, 0x12, 0x34, command])?;
+        std::thread::sleep(Duration::from_millis(150));
         let mut reply = [0_u8; 3];
-        let mut previous = None;
-        let mut stable = 0;
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(2));
-            self.read(MCU_PROXY, 0, &mut reply)?;
-            if previous == Some(reply) {
-                stable += 1;
-                if stable >= 2 {
-                    break;
-                }
-            } else {
-                stable = 0;
+        self.read(MCU_PROXY, 0, &mut reply)?;
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_millis(30));
+            let mut again = [0_u8; 3];
+            self.read(MCU_PROXY, 0, &mut again)?;
+            if again == reply {
+                return Ok(reply);
             }
-            previous = Some(reply);
+            reply = again;
         }
         Ok(reply)
     }
@@ -351,4 +368,33 @@ pub fn format_firmware_date(r: [u8; 3]) -> String {
     } else {
         format!("{:02x} {:02x} {:02x}", r[0], r[1], r[2])
     }
+}
+
+/// The plug-in sequence on any handle; see [`Control::initialise`].
+pub fn initialise_handle<T: rusb::UsbContext>(handle: &DeviceHandle<T>) -> Result<(), String> {
+    let out = rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Device);
+    let timeout = Duration::from_secs(1);
+    handle
+        .write_control(out, 0xec, 0, 0, &INIT_PAYLOAD, timeout)
+        .map_err(|error| format!("init request 0xec: {error}"))?;
+    match handle.write_control(out, 0xc1, 0xc039, 0, &[], timeout) {
+        Ok(_) | Err(rusb::Error::Pipe) => {}
+        Err(error) => return Err(format!("init request 0xc1/0xc039: {error}")),
+    }
+    handle
+        .write_control(out, 0xc1, 0x4134, 0, &[], timeout)
+        .map_err(|error| format!("init request 0xc1/0x4134: {error}"))?;
+    std::thread::sleep(Duration::from_millis(10));
+    let mut ready = [0_u8; 1];
+    let request_type = rusb::request_type(Direction::In, RequestType::Vendor, Recipient::Device);
+    handle
+        .read_control(request_type, 0xc1, 0x0039, 0, &mut ready, timeout)
+        .map_err(|error| format!("init readback 0xc1/0x0039: {error}"))?;
+    if ready[0] != 1 {
+        return Err(format!(
+            "init readback 0xc1/0x0039 answered {:#04x}, expected 0x01",
+            ready[0]
+        ));
+    }
+    Ok(())
 }

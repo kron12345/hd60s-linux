@@ -2,6 +2,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use std::{fs::File, io::Write};
 
+use hd60s_linux::control::Control;
 use hd60s_linux::device::{known_ids, revision as hd60s_revision};
 use hd60s_linux::edid;
 use hd60s_linux::frame::{self, Assembler, Event};
@@ -26,21 +27,6 @@ const AUDIO_GAIN_REGISTER: u16 = 0x003b;
 /// Bank holding the 256-byte EDID the device presents to its HDMI source; it
 /// is an EEPROM behind the device's microcontroller, accessed in 16-byte pieces.
 const EDID_BANK: u16 = 0x00a0;
-/// wValue of the microcontroller proxy: an OUT request carries a command, the
-/// following IN requests return the 3-byte reply once the MCU has processed it.
-const MCU_PROXY: u16 = 0x5066;
-/// Microcontroller status commands the official driver issues at PnP time:
-/// (command byte, meaning). The payload is `ab 03 12 34 <command>`.
-const MCU_STATUS_COMMANDS: [(u8, &str); 3] = [
-    (0x57, "status A"),
-    (0x58, "status B"),
-    (0x59, "presence handshake"),
-];
-/// Commands that must never reach the microcontroller from this tool.
-/// 0x60 turns the light strip on, unlocks the system registers, sets the
-/// boot-select bit and resets the MCU into its bootloader (LDROM): a firmware
-/// update entry point. Anything not in `MCU_STATUS_COMMANDS` is refused too.
-const MCU_FORBIDDEN_COMMANDS: [u8; 1] = [0x60];
 
 fn transfer_name(transfer_type: TransferType) -> &'static str {
     match transfer_type {
@@ -707,66 +693,22 @@ fn edid_command<T: UsbContext>(device: Device<T>, settings: EdidSettings) -> Res
     Ok(())
 }
 
-/// Issues the microcontroller status commands the official driver sends at
-/// PnP time and prints the replies. Only those commands are allowed; see
-/// `MCU_FORBIDDEN_COMMANDS`.
-fn mcu<T: UsbContext>(device: Device<T>) -> Result<(), String> {
-    let handle = device
-        .open()
-        .map_err(|error| format!("opening device: {error}"))?;
-    let write_type = rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Device);
-    let read_type = rusb::request_type(Direction::In, RequestType::Vendor, Recipient::Device);
-    let timeout = Duration::from_secs(1);
-    for (command, meaning) in MCU_STATUS_COMMANDS {
-        assert!(!MCU_FORBIDDEN_COMMANDS.contains(&command));
-        let payload = [0xab, 0x03, 0x12, 0x34, command];
-        handle
-            .write_control(
-                write_type,
-                REGISTER_REQUEST,
-                MCU_PROXY,
-                0,
-                &payload,
-                timeout,
-            )
-            .map_err(|error| format!("sending MCU command {command:#04x}: {error}"))?;
-        // The reply buffer keeps its previous content until the MCU has
-        // processed the command; the driver polls it a few times as well.
-        let mut reply = [0_u8; 3];
-        let mut previous = None;
-        let mut stable = 0;
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(2));
-            handle
-                .read_control(
-                    read_type,
-                    REGISTER_REQUEST,
-                    MCU_PROXY,
-                    0,
-                    &mut reply,
-                    timeout,
-                )
-                .map_err(|error| format!("reading MCU reply for {command:#04x}: {error}"))?;
-            if previous == Some(reply) {
-                stable += 1;
-                if stable >= 2 {
-                    break;
-                }
-            } else {
-                stable = 0;
-            }
-            previous = Some(reply);
-        }
+/// The three microcontroller status queries the official driver makes at
+/// plug-in, through the shared `Control` (which claims the interface and
+/// runs the plug-in sequence first).
+fn mcu_status() -> Result<(), String> {
+    let control = Control::open()?;
+    for (command, meaning) in hd60s_linux::control::MCU_STATUS {
+        let reply = control.mcu(command)?;
         println!(
             "command {command:#04x} ({meaning}): reply {:02x} {:02x} {:02x}",
             reply[0], reply[1], reply[2]
         );
     }
+    println!("firmware build date: {}", control.firmware_date()?);
     Ok(())
 }
 
-/// Shows or sets the audio gain register (bank 0x64, register 0x3b), the
-/// register behind the application's "Analog Audio Gain" slider.
 fn audio<T: UsbContext>(device: Device<T>, gain: Option<u8>) -> Result<(), String> {
     let handle = device
         .open()
@@ -1014,7 +956,10 @@ fn exclusive<T: UsbContext>(device: &Device<T>) -> Result<rusb::DeviceHandle<T>,
         .map_err(|error| format!("opening device: {error}"))?;
     let _ = handle.set_auto_detach_kernel_driver(true);
     match handle.claim_interface(0) {
-        Ok(()) => Ok(handle),
+        Ok(()) => {
+            hd60s_linux::control::initialise_handle(&handle)?;
+            Ok(handle)
+        }
         Err(rusb::Error::Busy) => Err(
             "the HD60 S is streaming in another process (hd60s-linux serve?); \
              talking to its registers from here could hang the card — use the control panel at \
@@ -1062,10 +1007,7 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
                     let _claim = exclusive(&device)?;
                     return edid_command(device, settings.clone());
                 }
-                Operation::Mcu => {
-                    let _claim = exclusive(&device)?;
-                    return mcu(device);
-                }
+                Operation::Mcu => return mcu_status(),
                 Operation::Status => return read_direct_startup_status(device),
                 Operation::Inspect => {}
             }

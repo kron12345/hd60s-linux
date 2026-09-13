@@ -80,13 +80,13 @@ everything the card exposes and lets you change what can be changed:
 The same is available as JSON under `/api/state`, `/api/set?brightness=…`
 and friends, `/preview.jpg`, `/edid.bin` and `/api/report`, for scripts.
 
-**Only one process may talk to the card at a time.** Register access from a
-second handle while another process streams has hung the card's
-microcontroller until the next power cycle (unplug and plug back; a USB
-reset is not enough). The command-line tools therefore refuse to touch the
-registers while `serve` holds the streaming interface — use the panel, or
-stop the service first — and `serve` itself reads the microcontroller and
-the EDID only before it starts streaming, as the official driver does.
+**Only one process may talk to the card at a time.** The command-line tools
+refuse to touch the registers while `serve` holds the streaming interface —
+use the panel, or stop the service first. Every open runs the official
+driver's plug-in sequence first; without it a microcontroller query hangs
+the card's USB controller until it is unplugged (see `docs/protocol.md`).
+If that ever happens: unplug the USB cable for a few seconds and plug it
+back — a USB reset is not enough — then use a current build.
 
 ### Diagnostics
 

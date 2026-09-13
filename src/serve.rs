@@ -48,8 +48,8 @@ pub struct Shared {
     pub geometry: Mutex<(usize, usize)>,
     pub device_present: AtomicBool,
     pub started: std::time::Instant,
-    /// (frames, seconds) samples for a recent frame rate.
-    fps_window: Mutex<VecDeque<(u64, f64)>>,
+    /// Arrival times of the frames of the last few seconds.
+    frame_times: Mutex<VecDeque<std::time::Instant>>,
     /// Register access through the streaming handle while the device is
     /// attached; `None` in between.
     pub control: Mutex<Option<Control>>,
@@ -79,18 +79,29 @@ impl Shared {
         Ok(())
     }
 
-    /// Frames per second over roughly the last five seconds.
+    /// Frames per second over the last five seconds.
     pub fn recent_fps(&self) -> f64 {
-        let now = self.started.elapsed().as_secs_f64();
-        let frames = self.stats.lock().unwrap().frames;
-        let mut window = self.fps_window.lock().unwrap();
-        window.push_back((frames, now));
-        while window.len() > 1 && now - window.front().unwrap().1 > 5.0 {
-            window.pop_front();
+        let mut times = self.frame_times.lock().unwrap();
+        let now = std::time::Instant::now();
+        while times
+            .front()
+            .is_some_and(|t| now.duration_since(*t).as_secs_f64() > 5.0)
+        {
+            times.pop_front();
         }
-        match (window.front(), window.back()) {
-            (Some(a), Some(b)) if b.1 > a.1 => (b.0 - a.0) as f64 / (b.1 - a.1),
+        match (times.front(), times.back()) {
+            (Some(first), Some(last)) if times.len() > 1 => {
+                (times.len() - 1) as f64 / last.duration_since(*first).as_secs_f64()
+            }
             _ => 0.0,
+        }
+    }
+
+    fn note_frame(&self) {
+        let mut times = self.frame_times.lock().unwrap();
+        times.push_back(std::time::Instant::now());
+        if times.len() > 600 {
+            times.pop_front();
         }
     }
 }
@@ -106,7 +117,7 @@ pub fn serve(name: &str, source: Source, panel: Option<String>) -> Result<(), St
         geometry: Mutex::new((0, 0)),
         device_present: AtomicBool::new(false),
         started: std::time::Instant::now(),
-        fps_window: Mutex::new(VecDeque::new()),
+        frame_times: Mutex::new(VecDeque::with_capacity(512)),
         control: Mutex::new(None),
         snapshot: Mutex::new(None),
         pending_edid: Mutex::new(None),
@@ -129,6 +140,7 @@ pub fn serve(name: &str, source: Source, panel: Option<String>) -> Result<(), St
     let pump_thread = std::thread::spawn(move || -> Result<(), String> {
         let on_frame = |shared: &Shared, frame: frame::Frame| {
             *shared.geometry.lock().unwrap() = (frame.width, frame.height);
+            shared.note_frame();
             let pixels = letterbox(frame, CANVAS_WIDTH, CANVAS_HEIGHT);
             *shared.latest.lock().unwrap() = Some(pixels);
         };
@@ -182,7 +194,9 @@ pub fn serve(name: &str, source: Source, panel: Option<String>) -> Result<(), St
                         }
                     };
                     let handle = Arc::new(handle);
-                    let control = match Control::from_handle(handle.clone(), &device) {
+                    let control = match Control::from_handle(handle.clone(), &device)
+                        .and_then(|control| control.initialise().map(|()| control))
+                    {
                         Ok(control) => control,
                         Err(error) => {
                             eprintln!("HD60 S: {error}; retrying");
@@ -221,6 +235,7 @@ pub fn serve(name: &str, source: Source, panel: Option<String>) -> Result<(), St
                     pump_shared.audio.lock().unwrap().clear();
                     pump_shared.device_present.store(false, Ordering::Relaxed);
                     *pump_shared.geometry.lock().unwrap() = (0, 0);
+                    pump_shared.frame_times.lock().unwrap().clear();
                     *pump_shared.run_stop.lock().unwrap() = None;
                     // Deferred jobs that needed the stream stopped.
                     let pending = pump_shared.pending_edid.lock().unwrap().take();
