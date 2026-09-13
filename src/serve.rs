@@ -85,6 +85,8 @@ pub fn serve(name: &str, source: Source) -> Result<(), String> {
                 let context =
                     Context::new().map_err(|error| format!("initializing libusb: {error}"))?;
                 let mut announced_missing = false;
+                let mut quiet = false;
+                let mut last_end: Option<String> = None;
                 while !pump_stop.load(Ordering::Relaxed) {
                     let Some(device) = device::find(&context) else {
                         if !announced_missing {
@@ -106,7 +108,9 @@ pub fn serve(name: &str, source: Source) -> Result<(), String> {
                             continue;
                         }
                     };
-                    eprintln!("HD60 S found; streaming");
+                    if !quiet {
+                        eprintln!("HD60 S found; streaming");
+                    }
                     let run_stop = Arc::new(AtomicBool::new(false));
                     let result = pump::run(
                         Input::Usb(handle),
@@ -119,12 +123,20 @@ pub fn serve(name: &str, source: Source) -> Result<(), String> {
                     // keep the nodes, and wait for it to come back.
                     *pump_shared.latest.lock().unwrap() = None;
                     pump_shared.audio.lock().unwrap().clear();
-                    match result {
-                        Ok(stats) => {
-                            eprintln!("HD60 S stream ended after {} frame(s)", stats.frames)
+                    // Report once per distinct outcome, not once per retry: another
+                    // instance holding the interface would otherwise log every second.
+                    let outcome = match &result {
+                        Ok(stats) if stats.frames > 0 => {
+                            format!("HD60 S stream ended after {} frame(s)", stats.frames)
                         }
-                        Err(error) => eprintln!("HD60 S stream ended: {error}"),
+                        Ok(_) => "HD60 S stream ended without frames".to_string(),
+                        Err(error) => format!("HD60 S stream ended: {error}"),
+                    };
+                    quiet = last_end.as_deref() == Some(outcome.as_str());
+                    if !quiet {
+                        eprintln!("{outcome}");
                     }
+                    last_end = Some(outcome);
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 }
                 Ok(())
