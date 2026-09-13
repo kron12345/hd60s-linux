@@ -2,6 +2,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use std::{fs::File, io::Write};
 
+use hd60s_linux::edid;
 use hd60s_linux::frame::{self, Assembler, Event};
 use rusb::{
     Context, Device, DeviceDescriptor, Direction, Recipient, RequestType, TransferType, UsbContext,
@@ -40,6 +41,24 @@ const PICTURE_REGISTER: u16 = 0x0013;
 /// Bank 0x64 register for the audio gain: 0x00 mutes, 0x80 is 0 dB, and
 /// each step is about 0.5 dB (measured -32 dB at 0x40, -16 dB at 0x60).
 const AUDIO_GAIN_REGISTER: u16 = 0x003b;
+/// Bank holding the 256-byte EDID the device presents to its HDMI source; it
+/// is an EEPROM behind the device's microcontroller, accessed in 16-byte pieces.
+const EDID_BANK: u16 = 0x00a0;
+/// wValue of the microcontroller proxy: an OUT request carries a command, the
+/// following IN requests return the 3-byte reply once the MCU has processed it.
+const MCU_PROXY: u16 = 0x5066;
+/// Microcontroller status commands the official driver issues at PnP time:
+/// (command byte, meaning). The payload is `ab 03 12 34 <command>`.
+const MCU_STATUS_COMMANDS: [(u8, &str); 3] = [
+    (0x57, "status A"),
+    (0x58, "status B"),
+    (0x59, "presence handshake"),
+];
+/// Commands that must never reach the microcontroller from this tool.
+/// 0x60 turns the light strip on, unlocks the system registers, sets the
+/// boot-select bit and resets the MCU into its bootloader (LDROM): a firmware
+/// update entry point. Anything not in `MCU_STATUS_COMMANDS` is refused too.
+const MCU_FORBIDDEN_COMMANDS: [u8; 1] = [0x60];
 
 fn transfer_name(transfer_type: TransferType) -> &'static str {
     match transfer_type {
@@ -583,6 +602,178 @@ struct PictureSettings {
     reset: bool,
 }
 
+/// Options for the `edid` command.
+#[derive(Default, Clone)]
+struct EdidSettings {
+    dump: Option<String>,
+    write: Option<String>,
+    restore: bool,
+    fix: bool,
+}
+
+fn read_edid<T: UsbContext>(handle: &rusb::DeviceHandle<T>) -> Result<[u8; 256], String> {
+    let read_type = rusb::request_type(Direction::In, RequestType::Vendor, Recipient::Device);
+    let mut edid = [0_u8; 256];
+    for offset in (0..256_u16).step_by(16) {
+        let chunk = &mut edid[offset as usize..offset as usize + 16];
+        let got = handle
+            .read_control(
+                read_type,
+                REGISTER_REQUEST,
+                EDID_BANK,
+                offset,
+                chunk,
+                Duration::from_secs(1),
+            )
+            .map_err(|error| format!("reading EDID bytes {offset}..: {error}"))?;
+        if got != 16 {
+            return Err(format!("reading EDID bytes {offset}..: got {got} bytes"));
+        }
+    }
+    Ok(edid)
+}
+
+fn write_edid<T: UsbContext>(
+    handle: &rusb::DeviceHandle<T>,
+    edid: &[u8; 256],
+) -> Result<(), String> {
+    let write_type = rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Device);
+    for offset in (0..256_u16).step_by(16) {
+        let chunk = &edid[offset as usize..offset as usize + 16];
+        handle
+            .write_control(
+                write_type,
+                REGISTER_REQUEST,
+                EDID_BANK,
+                offset,
+                chunk,
+                Duration::from_secs(1),
+            )
+            .map_err(|error| format!("writing EDID bytes {offset}..: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Reads, saves, writes or restores the EDID the device presents to its HDMI
+/// source (bank 0xa0), the way the official application does: 16-byte pieces,
+/// then a read-back. A block that fails validation is refused unless `--fix`
+/// recomputes its checksums. The source only re-reads the EDID on a hot-plug,
+/// so a change takes effect when the HDMI cable is reconnected.
+fn edid_command<T: UsbContext>(device: Device<T>, settings: EdidSettings) -> Result<(), String> {
+    let handle = device
+        .open()
+        .map_err(|error| format!("opening device: {error}"))?;
+    let current = read_edid(&handle)?;
+    println!("device: {}", edid::summary(&current));
+    if let Err(error) = edid::validate(&current) {
+        println!("device EDID is invalid: {error}");
+    }
+    if let Some(path) = &settings.dump {
+        std::fs::write(path, current).map_err(|error| format!("writing {path}: {error}"))?;
+        println!("saved 256 bytes to {path}");
+    }
+
+    let wanted: Option<[u8; 256]> = if settings.restore {
+        Some(edid::FACTORY)
+    } else if let Some(path) = &settings.write {
+        let bytes = std::fs::read(path).map_err(|error| format!("reading {path}: {error}"))?;
+        let mut block: [u8; 256] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| format!("{path}: expected 256 bytes, got {}", bytes.len()))?;
+        if settings.fix {
+            edid::fix_checksums(&mut block);
+        }
+        edid::validate(&block)
+            .map_err(|error| format!("{path}: {error} (use --fix to recompute)"))?;
+        Some(block)
+    } else {
+        None
+    };
+
+    if let Some(block) = wanted {
+        if block == current {
+            println!("device already holds this EDID; nothing written");
+            return Ok(());
+        }
+        write_edid(&handle, &block)?;
+        let back = read_edid(&handle)?;
+        let differing = back
+            .iter()
+            .zip(block.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        if differing == 0 {
+            println!("written and verified: {}", edid::summary(&back));
+        } else {
+            println!(
+                "written; read-back differs in {differing} byte(s) (the device may adjust fields): {}",
+                edid::summary(&back)
+            );
+        }
+        println!("reconnect the HDMI cable so the source reads the new EDID");
+    }
+    Ok(())
+}
+
+/// Issues the microcontroller status commands the official driver sends at
+/// PnP time and prints the replies. Only those commands are allowed; see
+/// `MCU_FORBIDDEN_COMMANDS`.
+fn mcu<T: UsbContext>(device: Device<T>) -> Result<(), String> {
+    let handle = device
+        .open()
+        .map_err(|error| format!("opening device: {error}"))?;
+    let write_type = rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Device);
+    let read_type = rusb::request_type(Direction::In, RequestType::Vendor, Recipient::Device);
+    let timeout = Duration::from_secs(1);
+    for (command, meaning) in MCU_STATUS_COMMANDS {
+        assert!(!MCU_FORBIDDEN_COMMANDS.contains(&command));
+        let payload = [0xab, 0x03, 0x12, 0x34, command];
+        handle
+            .write_control(
+                write_type,
+                REGISTER_REQUEST,
+                MCU_PROXY,
+                0,
+                &payload,
+                timeout,
+            )
+            .map_err(|error| format!("sending MCU command {command:#04x}: {error}"))?;
+        // The reply buffer keeps its previous content until the MCU has
+        // processed the command; the driver polls it a few times as well.
+        let mut reply = [0_u8; 3];
+        let mut previous = None;
+        let mut stable = 0;
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(2));
+            handle
+                .read_control(
+                    read_type,
+                    REGISTER_REQUEST,
+                    MCU_PROXY,
+                    0,
+                    &mut reply,
+                    timeout,
+                )
+                .map_err(|error| format!("reading MCU reply for {command:#04x}: {error}"))?;
+            if previous == Some(reply) {
+                stable += 1;
+                if stable >= 2 {
+                    break;
+                }
+            } else {
+                stable = 0;
+            }
+            previous = Some(reply);
+        }
+        println!(
+            "command {command:#04x} ({meaning}): reply {:02x} {:02x} {:02x}",
+            reply[0], reply[1], reply[2]
+        );
+    }
+    Ok(())
+}
+
 /// Shows or sets the audio gain register (bank 0x64, register 0x3b), the
 /// register behind the application's "Analog Audio Gain" slider.
 fn audio<T: UsbContext>(device: Device<T>, gain: Option<u8>) -> Result<(), String> {
@@ -813,6 +1004,8 @@ enum Operation {
     Signal(Option<u64>),
     Picture(PictureSettings),
     Audio(Option<u8>),
+    Edid(EdidSettings),
+    Mcu,
     Status,
 }
 
@@ -840,6 +1033,8 @@ fn run(show_serial: bool, operation: Operation) -> Result<(), String> {
                 Operation::Signal(seconds) => return read_signal(device, seconds),
                 Operation::Picture(ref settings) => return picture(device, settings.clone()),
                 Operation::Audio(gain) => return audio(device, gain),
+                Operation::Edid(ref settings) => return edid_command(device, settings.clone()),
+                Operation::Mcu => return mcu(device),
                 Operation::Status => return read_direct_startup_status(device),
                 Operation::Inspect => {}
             }
@@ -931,6 +1126,21 @@ fn main() -> ExitCode {
                 .map(|gain| Operation::Audio(Some(gain))),
             _ => Ok(Operation::Audio(None)),
         },
+        Some("edid") => {
+            let mut settings = EdidSettings::default();
+            let mut iter = arguments[1..].iter();
+            while let Some(argument) = iter.next() {
+                match argument.as_str() {
+                    "--dump" => settings.dump = iter.next().cloned(),
+                    "--write" => settings.write = iter.next().cloned(),
+                    "--restore" => settings.restore = true,
+                    "--fix" => settings.fix = true,
+                    _ => {}
+                }
+            }
+            Ok(Operation::Edid(settings))
+        }
+        Some("mcu") => Ok(Operation::Mcu),
         Some("status") => Ok(Operation::Status),
         _ => Ok(Operation::Inspect),
     };
@@ -938,9 +1148,9 @@ fn main() -> ExitCode {
         Ok(operation) => operation,
         Err(_) => {
             eprintln!(
-                "error: usage: hd60s-linux [status|signal|picture|audio|observe|observe-stream|observe-iso|capture] \\
+                "error: usage: hd60s-linux [status|signal|picture|audio|edid|mcu|observe|observe-stream|observe-iso|capture] \\
                  [SECONDS] [--audio FILE] [--native]\n       picture [--range standard|expanded] \\
-                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]"
+                 [--brightness N] [--contrast N] [--saturation N] [--hue N] [--reset]\n       audio [--gain N|--mute]\n       edid [--dump FILE] [--write FILE [--fix]] [--restore]"
             );
             return ExitCode::FAILURE;
         }

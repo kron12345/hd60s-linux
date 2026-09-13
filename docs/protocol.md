@@ -238,6 +238,37 @@ private (they contain the serial and captured video).
     unchanged after a write — status, not configuration.
   - The application never rewrites the EDID for any setting; it does not
     force an input resolution on the source.
+  - `hd60s-linux edid` reads the EDID from bank `0xa0`, saves it (`--dump`),
+    writes one from a file (`--write`, refused unless header and both block
+    checksums are valid, `--fix` recomputes them) or restores the power-on
+    block (`--restore`), then reads it back. This is the only way to tell a
+    source what it may send — the application never does it, but with it a
+    console or camera can be limited to 1080p or 720p. The source re-reads
+    the EDID on hot-plug only.
+
+### Microcontroller commands
+
+The proxy `0x5066` carries commands to the device's microcontroller: an OUT
+request with payload `ab 03 12 34 <command>`, then IN requests that return a
+3-byte reply once the MCU has processed it (the buffer keeps its previous
+content until then, so the driver polls). The driver issues `0x57` and
+`0x58` at PnP time. Measured replies on the Rev. 4 unit: `51 10 27` for
+`0x57`, `14 09 18` for `0x58`, `51 10 18` for `0x59`. Their meaning is not
+established (the MCU firmware image that ships with the Windows application
+answers these commands with different bytes, so it is not the firmware this
+unit runs). `hd60s-linux mcu` issues exactly these three.
+
+**Command `0x60` must never be sent.** It turns the light strip on, unlocks
+the system registers, sets the boot-select bit and resets the MCU into its
+bootloader — the firmware-update entry point. The tool refuses anything
+outside the three status commands. (Established by reading the MCU firmware
+image that ships with the Windows application; the image itself is not part
+of this repository, and the unit at hand runs a different firmware build, so
+the command is avoided on the assumption that the entry point is shared.)
+
+The light strip is driven by that microcontroller (two channels: PA4+PA6 and
+PC7) and, in normal operation, never switched on by its firmware; there is no
+USB command for it.
   - `hd60s-linux picture` reads and writes these two registers from Linux
     with the same requests. **These controls also change the picture on the
     HDMI pass-through output** (observed on a monitor attached to it): the

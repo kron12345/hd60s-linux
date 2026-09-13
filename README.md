@@ -65,6 +65,23 @@ cargo run --release -- audio --gain 104   # about -12 dB
 cargo run --release -- audio --mute
 ```
 
+EDID — what the device tells its HDMI source it accepts (bank `0xa0`). Save
+it, write a different one (validated; `--fix` recomputes checksums), or go
+back to the power-on block; the source picks it up on the next hot-plug:
+
+```bash
+cargo run --release -- edid --dump current.bin
+cargo run --release -- edid --write custom.bin
+cargo run --release -- edid --restore
+```
+
+Microcontroller status, the three queries the official driver makes at
+plug-in (nothing else can be sent through this path — see `docs/protocol.md`):
+
+```bash
+cargo run --release -- mcu
+```
+
 ## USB characterization
 
 The `hd60s-linux` binary locates the device and prints its configurations,
