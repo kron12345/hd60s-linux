@@ -52,6 +52,11 @@ kernel driver bound to the device is detached automatically. Frames are
 always 1920x1080 YUYV (smaller sources are centred on a black canvas), audio
 is 48 kHz stereo.
 
+The service waits for a card if none is present and picks it up again after
+an unplug or reset; the camera and microphone nodes stay in place meanwhile
+(viewers see black and silence), so OBS keeps its sources. Run only one
+instance: a second one finds the interface busy and just keeps waiting.
+
 `tools/hd60s-serve.service` runs it as a systemd user unit; `--name` changes
 the node names; `--from-file RAW [--fps N]` replays a recorded raw stream
 instead of the device, for development without hardware.
