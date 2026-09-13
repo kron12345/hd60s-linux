@@ -8,14 +8,12 @@
 //! the desktop as a running application.
 
 use std::cell::RefCell;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use hd60s_api::{self as api, Command, State};
 use slint::{ComponentHandle, Image, Rgb8Pixel, SharedPixelBuffer};
 
 slint::include_modules!();
@@ -37,7 +35,7 @@ pub struct Runtime {
     pub busy: AtomicBool,
     pub own: std::sync::Mutex<Option<OwnService>>,
     /// The latest state, for a window created later.
-    pub last_state: std::sync::Mutex<Option<Value>>,
+    pub last_state: std::sync::Mutex<Option<State>>,
     pub last_service: std::sync::Mutex<ServiceView>,
 }
 
@@ -61,63 +59,6 @@ fn with_window(f: impl FnOnce(&MainWindow)) {
             f(ui);
         }
     });
-}
-
-// ---------------------------------------------------------------- service API
-
-fn socket_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("hd60s-linux/api.sock")
-}
-
-/// One HTTP request over the Unix socket; returns status and body.
-fn api(method: &str, path: &str) -> Result<(u16, Vec<u8>), String> {
-    let mut stream = UnixStream::connect(socket_path())
-        .map_err(|error| format!("service not running ({error})"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|e| e.to_string())?;
-    stream
-        .write_all(
-            format!("{method} {path} HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
-    let mut data = Vec::new();
-    stream.read_to_end(&mut data).map_err(|e| e.to_string())?;
-    let split = data
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("malformed reply")?;
-    let head = String::from_utf8_lossy(&data[..split]);
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    Ok((status, data[split + 4..].to_vec()))
-}
-
-fn state() -> Result<Value, String> {
-    let (_, body) = api("GET", "/api/state")?;
-    serde_json::from_slice(&body).map_err(|e| e.to_string())
-}
-
-pub fn post(path: &str) -> String {
-    match api("POST", path) {
-        Ok((_, body)) => {
-            let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            v["message"]
-                .as_str()
-                .or(v["changed"].as_str())
-                .or(v["error"].as_str())
-                .unwrap_or("")
-                .to_string()
-        }
-        Err(error) => error,
-    }
 }
 
 // ------------------------------------------------------------ device access
@@ -363,152 +304,120 @@ fn yuyv_to_rgb(frame: &[u8], factor: usize) -> SharedPixelBuffer<Rgb8Pixel> {
 
 // -------------------------------------------------------------------- UI
 
-fn text(v: &Value, key: &str) -> String {
-    v[key].as_str().unwrap_or("").to_string()
-}
-
-fn apply_state(ui: &MainWindow, s: &Value) {
-    let device = &s["device"];
-    let present = device["present"].as_bool().unwrap_or(false);
+fn apply_state(ui: &MainWindow, s: &State) {
+    let device = &s.device;
     ui.set_connected(true);
-    ui.set_device_present(present);
-    let timing = &s["timing"];
-    let signal = timing["present"].as_bool().unwrap_or(false);
-    ui.set_headline(if !present {
-        "no card on the bus".into()
-    } else if signal {
-        format!("{} · streaming", text(device, "revision")).into()
-    } else {
-        format!("{} · no HDMI signal", text(device, "revision")).into()
-    });
+    ui.set_device_present(device.present);
+    let signal = s.timing.as_ref().is_some_and(|t| t.present);
+    ui.set_headline(
+        if !device.present {
+            "no card on the bus".to_string()
+        } else if signal {
+            format!("{} · streaming", device.revision)
+        } else {
+            format!("{} · no HDMI signal", device.revision)
+        }
+        .into(),
+    );
     ui.set_input_text(
-        timing["text"]
-            .as_str()
-            .or(timing["error"].as_str())
-            .unwrap_or("–")
+        s.timing
+            .as_ref()
+            .map(|t| t.text.clone())
+            .or_else(|| s.timing_error.clone())
+            .unwrap_or_else(|| "–".into())
             .into(),
     );
-    let st = &s["stream"];
+    let st = &s.stream;
     ui.set_stream_text(
         format!(
             "{:.1} fps · {} frame(s) · {} bad · {} format change(s) · source {}x{}",
-            st["fps"].as_f64().unwrap_or(0.0),
-            st["frames"],
-            st["bad"],
-            st["format_changes"],
-            st["geometry"][0],
-            st["geometry"][1]
+            st.fps, st.frames, st.bad, st.format_changes, st.geometry[0], st.geometry[1]
         )
         .into(),
     );
-    if present {
+    if device.present {
         ui.set_device_text(
             format!(
                 "{} ({}) · firmware {} · MCU build {} · USB {} bus {} address {}",
-                text(device, "revision"),
-                text(device, "product_id"),
-                text(device, "firmware"),
-                text(device, "mcu_build"),
-                text(device, "speed"),
-                device["bus"],
-                device["address"]
+                device.revision,
+                device.product_id,
+                device.firmware,
+                device.mcu_build,
+                device.speed,
+                device.bus,
+                device.address
             )
             .into(),
         );
-        let settings = &s["settings"];
-        if settings["picture"].is_array() && !ui.get_interacting() {
-            let p = &settings["picture"];
-            let get = |i: usize| p[i].as_i64().unwrap_or(128) as i32;
-            ui.set_brightness(get(0));
-            ui.set_contrast(get(1));
-            ui.set_saturation(get(2));
-            ui.set_hue(get(3));
-            ui.set_gain(settings["gain"].as_i64().unwrap_or(128) as i32);
-            ui.set_gain_db(
-                format!("{:+.1} dB", settings["gain_db"].as_f64().unwrap_or(0.0)).into(),
-            );
-            ui.set_range_index(settings["range"].as_i64().unwrap_or(0).min(2) as i32);
+        if let Some(p) = &s.settings
+            && !ui.get_interacting()
+        {
+            ui.set_brightness(p.picture[0] as i32);
+            ui.set_contrast(p.picture[1] as i32);
+            ui.set_saturation(p.picture[2] as i32);
+            ui.set_hue(p.picture[3] as i32);
+            ui.set_gain(p.gain as i32);
+            ui.set_gain_db(format!("{:+.1} dB", p.gain_db).into());
+            ui.set_range_index(p.range.min(2) as i32);
         }
     } else {
-        ui.set_device_text(text(device, "error").into());
+        ui.set_device_text(device.error.clone().unwrap_or_default().into());
     }
-    let edid = &s["edid"];
     ui.set_edid_text(
-        if edid.is_object() {
-            format!(
+        match (&s.edid, &s.edid_error) {
+            (Some(e), _) => format!(
                 "{} — {}{}",
-                text(edid, "summary"),
-                if edid["valid"].as_bool().unwrap_or(false) {
-                    "valid"
-                } else {
-                    "INVALID"
-                },
-                if edid["factory"].as_bool().unwrap_or(false) {
+                e.summary,
+                if e.valid { "valid" } else { "INVALID" },
+                if e.factory {
                     ", power-on block"
                 } else {
                     ", custom"
                 }
-            )
-        } else {
-            String::new()
+            ),
+            (None, Some(error)) => error.clone(),
+            (None, None) => String::new(),
         }
         .into(),
     );
-    if let Some(mcu) = s["mcu"].as_array() {
-        ui.set_mcu_text(
-            mcu.iter()
-                .map(|m| {
-                    format!(
-                        "{} {}: {}",
-                        text(m, "command"),
-                        text(m, "meaning"),
-                        text(m, "reply")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-                .into(),
-        );
-    }
-    let rec = &s["recording"];
-    ui.set_recording(rec.is_object());
+    ui.set_mcu_text(
+        s.mcu
+            .iter()
+            .map(|m| format!("{} {}: {}", m.command, m.meaning, m.reply))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into(),
+    );
+    ui.set_recording(s.recording.is_some());
     ui.set_recording_text(
-        if rec.is_object() {
-            let secs = rec["seconds"].as_f64().unwrap_or(0.0) as u64;
-            format!(
-                "{} · {}:{:02} · {} MB · {} dropped",
-                text(rec, "path"),
-                secs / 60,
-                secs % 60,
-                rec["bytes"].as_u64().unwrap_or(0) / 1_000_000,
-                rec["dropped"]
-            )
-        } else {
-            format!(
-                "off · files go to {} · encoder {}",
-                text(s, "record_dir"),
-                text(s, "encoder")
-            )
-        }
-        .into(),
-    );
-    let net = &s["network_stream"];
-    ui.set_stream_available(net.is_object());
-    ui.set_stream_on(net["enabled"].as_bool().unwrap_or(false));
-    ui.set_network_text(
-        if net.is_object() {
-            if net["enabled"].as_bool().unwrap_or(false) {
-                format!("{} · {} client(s)", text(net, "url"), net["clients"])
-            } else {
-                format!("off (would be {})", text(net, "url"))
+        match &s.recording {
+            Some(r) => {
+                let secs = r.seconds as u64;
+                format!(
+                    "{} · {}:{:02} · {} MB · {} dropped",
+                    r.path,
+                    secs / 60,
+                    secs % 60,
+                    r.bytes / 1_000_000,
+                    r.dropped
+                )
             }
-        } else {
-            "not configured".into()
+            None => format!("off · files go to {} · encoder {}", s.record_dir, s.encoder),
         }
         .into(),
     );
-    if let Some(message) = s["message"].as_str() {
-        ui.set_message(message.into());
+    ui.set_stream_available(s.network_stream.is_some());
+    ui.set_stream_on(s.network_stream.as_ref().is_some_and(|n| n.enabled));
+    ui.set_network_text(
+        match &s.network_stream {
+            Some(n) if n.enabled => format!("{} · {} client(s)", n.url, n.clients),
+            Some(n) => format!("off (would be {})", n.url),
+            None => "not configured".into(),
+        }
+        .into(),
+    );
+    if let Some(message) = &s.message {
+        ui.set_message(message.clone().into());
     }
 }
 
@@ -528,11 +437,11 @@ fn apply_service(ui: &MainWindow, view: &ServiceView) {
     ui.set_access_fixable(view.access_fixable);
 }
 
-/// Runs a request off the UI thread, then refreshes.
-fn act(path: String) {
+/// Sends a command off the UI thread, then refreshes.
+fn act(command: Command) {
     std::thread::spawn(move || {
-        let message = post(&path);
-        let refreshed = state().ok();
+        let message = api::send(&command).text();
+        let refreshed = api::state().ok();
         let _ = slint::invoke_from_event_loop(move || {
             with_window(|ui| {
                 if let Some(s) = &refreshed {
@@ -542,6 +451,12 @@ fn act(path: String) {
             });
         });
     });
+}
+
+fn picture_key(key: &str) -> Option<&'static str> {
+    ["brightness", "contrast", "saturation", "hue"]
+        .into_iter()
+        .find(|k| *k == key)
 }
 
 /// Creates the window with all its callbacks; the caller shows it.
@@ -577,20 +492,26 @@ fn build_window(runtime: &Arc<Runtime>) -> Result<MainWindow, slint::PlatformErr
             }
         });
     }
-    ui.on_set_control(|key, value| act(format!("/api/set?{key}={value}")));
-    ui.on_set_range(|index| act(format!("/api/set?range={index}")));
-    ui.on_set_gain(|value| act(format!("/api/set?gain={value}")));
-    ui.on_reset_picture(|| act("/api/set?reset=1".into()));
+    ui.on_set_control(|key, value| {
+        if let Some(key) = picture_key(&key) {
+            act(Command::Picture {
+                key,
+                value: value.clamp(0, 255) as u8,
+            });
+        }
+    });
+    ui.on_set_range(|index| act(Command::Range(index.clamp(0, 2) as u8)));
+    ui.on_set_gain(|value| act(Command::Gain(value.clamp(0, 255) as u8)));
+    ui.on_reset_picture(|| act(Command::ResetPicture));
     {
         let weak = ui.as_weak();
         ui.on_toggle_record(move || {
             let ui = weak.unwrap();
             act(if ui.get_recording() {
-                "/api/record?stop=1"
+                Command::RecordStop
             } else {
-                "/api/record?start=1"
-            }
-            .into());
+                Command::RecordStart
+            });
         });
     }
     {
@@ -598,17 +519,16 @@ fn build_window(runtime: &Arc<Runtime>) -> Result<MainWindow, slint::PlatformErr
         ui.on_toggle_stream(move || {
             let ui = weak.unwrap();
             act(if ui.get_stream_on() {
-                "/api/stream?off=1"
+                Command::StreamOff
             } else {
-                "/api/stream?on=1"
-            }
-            .into());
+                Command::StreamOn
+            });
         });
     }
-    ui.on_restore_edid(|| act("/api/edid?restore=1".into()));
+    ui.on_restore_edid(|| act(Command::RestoreEdid));
     ui.on_generate_report(|| {
         std::thread::spawn(|| {
-            let report = match api("GET", "/api/report") {
+            let report = match api::request("GET", "/api/report") {
                 Ok((_, body)) => String::from_utf8_lossy(&body).into_owned(),
                 Err(error) => error,
             };
@@ -637,7 +557,7 @@ fn build_window(runtime: &Arc<Runtime>) -> Result<MainWindow, slint::PlatformErr
         ui.on_toggle_service(move || {
             let runtime = runtime.clone();
             std::thread::spawn(move || {
-                let running = state().is_ok();
+                let running = api::state().is_ok();
                 let message = if running {
                     if runtime.own.lock().unwrap().take().is_some() {
                         "service stopped".to_string()
@@ -742,7 +662,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let mut tick = 0_u32;
             let mut tried_own = false;
             loop {
-                let result = state();
+                let result = api::state();
                 if result.is_ok() {
                     tried_own = false;
                 }
@@ -824,7 +744,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 let wanted = WINDOW_OPEN.load(Ordering::Relaxed);
                 if wanted
                     && !runtime.busy.load(Ordering::Relaxed)
-                    && let Ok((200, frame)) = api("GET", "/frame.yuyv")
+                    && let Ok((200, frame)) = api::request("GET", "/frame.yuyv")
                     && frame.len() == WIDTH * HEIGHT * 2
                 {
                     let rgb = yuyv_to_rgb(&frame, runtime.factor.load(Ordering::Relaxed).max(1));

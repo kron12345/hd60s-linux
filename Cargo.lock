@@ -1803,12 +1803,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hd60s-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hd60s-control"
 version = "0.1.0"
 dependencies = [
+ "hd60s-api",
  "ksni",
  "libc",
- "serde_json",
  "slint",
  "slint-build",
 ]
@@ -1817,8 +1825,8 @@ dependencies = [
 name = "hd60s-linux"
 version = "0.1.0"
 dependencies = [
+ "hd60s-api",
  "jpeg-encoder",
- "ksni",
  "libc",
  "libspa",
  "libusb1-sys",
@@ -1826,6 +1834,7 @@ dependencies = [
  "pipewire",
  "pipewire-vircam",
  "rusb",
+ "serde_json",
 ]
 
 [[package]]

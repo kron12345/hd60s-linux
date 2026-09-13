@@ -1,25 +1,26 @@
-//! The control panel: a small HTTP server inside `serve`, bound to
-//! localhost, with a single page that shows the input, a live preview, the
-//! picture controls, colour range, audio gain, EDID, MCU status and the
-//! stream statistics — and lets the user change what can be changed.
-//!
-//! Plain HTTP/1.1 on `std::net`, one thread per connection, no framework:
-//! the page is embedded, the API answers JSON, the preview is a JPEG of the
-//! latest frame. Register access opens its own control connection per
-//! request; that needs no interface claim, so it works while streaming.
+//! The service's API and web panel: `GET /api/state` returns the
+//! [`hd60s_api::State`], `POST /api/...` changes things, and a few binary
+//! endpoints hand out the picture and the EDID. The same handler serves
+//! the Unix socket (trusted: same user) and, when switched on, a TCP port
+//! for browsers and remote scripts (guarded by a token and Host/Origin
+//! checks). The embedded page is a web version of the control program.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use hd60s_api::{Outcome, State};
+
 use crate::control;
 use crate::edid;
+use crate::http::{Request, host_allowed, parse, respond, respond_json};
 use crate::report;
 use crate::serve::Shared;
 
 const PAGE: &str = include_str!("panel.html");
 
+/// The web panel on a TCP address.
 pub fn run(address: &str, shared: Arc<Shared>) -> Result<(), String> {
     let listener = TcpListener::bind(address)
         .map_err(|error| format!("binding the panel to {address}: {error}"))?;
@@ -35,293 +36,172 @@ pub fn run(address: &str, shared: Arc<Shared>) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) struct Request {
-    pub method: String,
-    pub path: String,
-    query: Vec<(String, String)>,
-    headers: Vec<(String, String)>,
-}
-
-impl Request {
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
+/// Serves the same API on a Unix socket for programs of the same user
+/// (`hd60s-control`); the socket's permissions replace the token.
+pub fn run_unix(path: &std::path::Path, shared: Arc<Shared>) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
     }
-
-    /// Whether the request may change anything: it must carry the token
-    /// (header `X-Token` or query `token`), and if a browser sent an
-    /// `Origin`, that origin must be this server itself.
-    pub fn authorised(&self, token: &str) -> bool {
-        let presented = self
-            .header("x-token")
-            .or_else(|| self.get("token"))
-            .unwrap_or("");
-        if presented != token {
-            return false;
-        }
-        match (self.header("origin"), self.header("host")) {
-            (Some(origin), Some(host)) => origin == format!("http://{host}"),
-            (Some(_), None) => false,
-            (None, _) => true,
-        }
+    // Never take the socket from a live instance (a second `serve` would
+    // otherwise cut the first one off from its clients).
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return Err(format!(
+            "another instance already serves {}; this one offers no API socket",
+            path.display()
+        ));
     }
-
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.query
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
-    }
-    pub fn number(&self, key: &str) -> Option<u8> {
-        self.get(key).and_then(|v| v.parse::<u8>().ok())
-    }
-}
-
-pub(crate) fn parse<S: Read>(stream: &mut S) -> Option<Request> {
-    let mut buffer = [0_u8; 8192];
-    let mut data = Vec::new();
-    loop {
-        let n = stream.read(&mut buffer).ok()?;
-        if n == 0 {
+    let _ = std::fs::remove_file(path);
+    let listener = std::os::unix::net::UnixListener::bind(path)
+        .map_err(|error| format!("binding the API socket {}: {error}", path.display()))?;
+    eprintln!("API socket at {}", path.display());
+    for stream in listener.incoming() {
+        if shared.stop.load(Ordering::Relaxed) {
             break;
         }
-        data.extend_from_slice(&buffer[..n]);
-        if data.windows(4).any(|w| w == b"\r\n\r\n") || data.len() > 65536 {
-            break;
-        }
+        let Ok(stream) = stream else { continue };
+        let shared = shared.clone();
+        std::thread::spawn(move || handle(stream, shared, true));
     }
-    let text = String::from_utf8_lossy(&data);
-    let mut lines = text.lines();
-    let line = lines.next()?;
-    let headers = lines
-        .take_while(|l| !l.is_empty())
-        .filter_map(|l| l.split_once(':'))
-        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
-        .collect();
-    let mut parts = line.split_whitespace();
-    let method = parts.next()?.to_string();
-    let target = parts.next()?;
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let query = query
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            (percent_decode(k), percent_decode(v))
-        })
-        .collect();
-    Some(Request {
-        method,
-        path: path.to_string(),
-        query,
-        headers,
-    })
+    Ok(())
 }
 
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    out.push(v);
-                    i += 3;
-                    continue;
-                }
-                out.push(b'%');
-                i += 1;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-pub(crate) fn respond<W: Write>(stream: &mut W, status: &str, content_type: &str, body: &[u8]) {
-    let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body);
-    let _ = stream.flush();
-}
-
-fn json_string(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn state_json(shared: &Shared) -> String {
-    let mut fields = Vec::new();
+/// Everything a client wants to know, read from the shared state and, for
+/// timing and settings, from the card through the streaming handle.
+pub fn state(shared: &Shared) -> State {
     let stats = *shared.stats.lock().unwrap();
-    let uptime = shared.started.elapsed().as_secs_f64();
     let geometry = *shared.geometry.lock().unwrap();
-    fields.push(format!(
-        "\"stream\":{{\"frames\":{},\"bad\":{},\"format_changes\":{},\"audio_blocks\":{},\"fps\":{:.1},\"present\":{},\"geometry\":[{},{}],\"uptime\":{:.0}}}",
-        stats.frames,
-        stats.bad_frames,
-        stats.format_changes,
-        stats.audio_blocks,
-        shared.recent_fps(),
-        shared.device_present.load(Ordering::Relaxed),
-        geometry.0,
-        geometry.1,
-        uptime
-    ));
-    if let Some(message) = shared.message.lock().unwrap().as_ref() {
-        fields.push(format!("\"message\":{}", json_string(message)));
-    }
-    match shared.recording_status() {
-        Some(status) => fields.push(format!(
-            "\"recording\":{{\"path\":{},\"seconds\":{:.0},\"bytes\":{},\"dropped\":{}}}",
-            json_string(&status.path.display().to_string()),
-            status.seconds,
-            status.bytes,
-            status.dropped_frames
-        )),
-        None => fields.push("\"recording\":null".to_string()),
-    }
-    fields.push(format!(
-        "\"record_dir\":{}",
-        json_string(&shared.record_dir.display().to_string())
-    ));
-    fields.push(format!(
-        "\"encoder\":{}",
-        json_string(
-            shared
-                .resolved_encoder
-                .lock()
-                .unwrap()
-                .map(|e| e.name())
-                .unwrap_or(shared.record_encoder.name())
-        )
-    ));
-    match &shared.stream_bind {
-        Some(bind) => {
-            let host = std::process::Command::new("hostname")
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|h| !h.is_empty())
-                .unwrap_or_else(|| "localhost".into());
-            let port = bind.rsplit(':').next().unwrap_or("8061");
-            fields.push(format!(
-                "\"network_stream\":{{\"enabled\":{},\"url\":{},\"clients\":{},\"fps\":{},\"scale\":{}}}",
-                shared.network_stream.load(Ordering::Relaxed),
-                json_string(&format!("http://{host}:{port}/stream.mjpg")),
-                shared.stream_clients.load(Ordering::Relaxed),
-                shared.stream_fps,
-                shared.stream_scale
-            ));
-        }
-        None => fields.push("\"network_stream\":null".to_string()),
-    }
+    let mut state = State {
+        stream: hd60s_api::StreamStats {
+            frames: stats.frames,
+            bad: stats.bad_frames,
+            format_changes: stats.format_changes,
+            audio_blocks: stats.audio_blocks,
+            fps: shared.recent_fps(),
+            present: shared.device_present.load(Ordering::Relaxed),
+            geometry: [geometry.0, geometry.1],
+            uptime: shared.started.elapsed().as_secs(),
+        },
+        message: shared.message.lock().unwrap().clone(),
+        recording: shared
+            .recording_status()
+            .map(|s| hd60s_api::RecordingStatus {
+                path: s.path.display().to_string(),
+                seconds: s.seconds,
+                bytes: s.bytes,
+                dropped: s.dropped_frames,
+            }),
+        record_dir: shared.record_dir.display().to_string(),
+        encoder: shared
+            .resolved_encoder
+            .lock()
+            .unwrap()
+            .map(|e| e.name())
+            .unwrap_or(shared.record_encoder.name())
+            .to_string(),
+        network_stream: shared
+            .stream_bind
+            .as_ref()
+            .map(|bind| hd60s_api::NetworkStream {
+                enabled: shared.network_stream.load(Ordering::Relaxed),
+                url: format!(
+                    "http://{}:{}/stream.mjpg",
+                    hostname(),
+                    bind.rsplit(':').next().unwrap_or("8061")
+                ),
+                clients: shared.stream_clients.load(Ordering::Relaxed),
+                fps: shared.stream_fps,
+                scale: shared.stream_scale,
+            }),
+        ..Default::default()
+    };
     let control = shared.control.lock().unwrap();
     let snapshot = shared.snapshot.lock().unwrap();
     match control.as_ref() {
         Some(control) => {
-            fields.push(format!(
-                "\"device\":{{\"present\":true,\"revision\":{},\"product_id\":\"0fd9:{:04x}\",\"firmware\":{},\"speed\":{},\"bus\":{},\"address\":{},\"mcu_build\":{}}}",
-                json_string(control.revision),
-                control.product_id,
-                json_string(&control.device_version),
-                json_string(&format!("{:?}", control.speed)),
-                control.bus,
-                control.address,
-                json_string(
-                    &snapshot
-                        .as_ref()
-                        .map(|s| s.firmware_date.clone().unwrap_or_else(|e| e))
-                        .unwrap_or_else(|| "not read".into())
-                )
-            ));
+            state.device = hd60s_api::Device {
+                present: true,
+                error: None,
+                revision: control.revision.to_string(),
+                product_id: format!("0fd9:{:04x}", control.product_id),
+                firmware: control.device_version.clone(),
+                speed: format!("{:?}", control.speed),
+                bus: control.bus,
+                address: control.address,
+                mcu_build: snapshot
+                    .as_ref()
+                    .map(|s| s.firmware_date.clone().unwrap_or_else(|e| e))
+                    .unwrap_or_else(|| "not read".into()),
+            };
             match control.timing() {
-                Ok(t) => fields.push(format!(
-                    "\"timing\":{{\"present\":{},\"width\":{},\"height\":{},\"total_width\":{},\"total_height\":{},\"refresh\":{},\"text\":{}}}",
-                    t.present(),
-                    t.width,
-                    t.height,
-                    t.total_width,
-                    t.total_height,
-                    t.refresh,
-                    json_string(&t.to_string())
-                )),
-                Err(e) => fields.push(format!("\"timing\":{{\"error\":{}}}", json_string(&e))),
+                Ok(t) => {
+                    state.timing = Some(hd60s_api::Timing {
+                        present: t.present(),
+                        width: t.width,
+                        height: t.height,
+                        total_width: t.total_width,
+                        total_height: t.total_height,
+                        refresh: t.refresh,
+                        text: t.to_string(),
+                    })
+                }
+                Err(e) => state.timing_error = Some(e),
             }
             match control.settings() {
-                Ok(s) => fields.push(format!(
-                    "\"settings\":{{\"range\":{},\"range_name\":{},\"picture\":[{},{},{},{}],\"gain\":{},\"gain_db\":{:.1}}}",
-                    s.colour_range,
-                    json_string(control::colour_range_name(s.colour_range)),
-                    s.picture[0],
-                    s.picture[1],
-                    s.picture[2],
-                    s.picture[3],
-                    s.audio_gain,
-                    control::gain_db(s.audio_gain)
-                )),
-                Err(e) => fields.push(format!("\"settings\":{{\"error\":{}}}", json_string(&e))),
+                Ok(s) => {
+                    state.settings = Some(hd60s_api::Settings {
+                        range: s.colour_range,
+                        range_name: control::colour_range_name(s.colour_range).to_string(),
+                        picture: s.picture,
+                        gain: s.audio_gain,
+                        gain_db: control::gain_db(s.audio_gain),
+                    })
+                }
+                Err(e) => state.settings_error = Some(e),
             }
         }
-        None => fields
-            .push("\"device\":{\"present\":false,\"error\":\"no HD60 S attached\"}".to_string()),
+        None => {
+            state.device.error = Some("no HD60 S attached".into());
+        }
     }
     if let Some(snapshot) = snapshot.as_ref() {
         match &snapshot.edid {
-            Ok(block) => fields.push(format!(
-                "\"edid\":{{\"summary\":{},\"valid\":{},\"factory\":{}}}",
-                json_string(&edid::summary(block)),
-                edid::validate(block).is_ok(),
-                *block == edid::FACTORY
-            )),
-            Err(e) => fields.push(format!("\"edid\":{{\"error\":{}}}", json_string(e))),
+            Ok(block) => {
+                state.edid = Some(hd60s_api::Edid {
+                    summary: edid::summary(block),
+                    valid: edid::validate(block).is_ok(),
+                    factory: *block == edid::FACTORY,
+                })
+            }
+            Err(e) => state.edid_error = Some(e.clone()),
         }
-        let mcu = snapshot
+        state.mcu = snapshot
             .mcu
             .iter()
-            .map(|(command, meaning, reply)| {
-                let reply = match reply {
+            .map(|(command, meaning, reply)| hd60s_api::McuReply {
+                command: format!("{command:#04x}"),
+                meaning: meaning.to_string(),
+                reply: match reply {
                     Ok(r) => format!("{:02x} {:02x} {:02x}", r[0], r[1], r[2]),
                     Err(e) => e.clone(),
-                };
-                format!(
-                    "{{\"command\":\"{command:#04x}\",\"meaning\":{},\"reply\":{}}}",
-                    json_string(meaning),
-                    json_string(&reply)
-                )
+                },
             })
-            .collect::<Vec<_>>();
-        fields.push(format!("\"mcu\":[{}]", mcu.join(",")));
-        fields.push(format!(
-            "\"snapshot_age\":{}",
-            snapshot.taken.elapsed().as_secs()
-        ));
+            .collect();
+        state.snapshot_age = Some(snapshot.taken.elapsed().as_secs());
     }
-    format!("{{{}}}", fields.join(","))
+    state
 }
 
+fn hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "localhost".into())
+}
+
+/// `POST /api/set`: picture registers, colour range, gain, or a reset.
 fn apply(shared: &Shared, request: &Request) -> Result<String, String> {
     let control = shared.control.lock().unwrap();
     let control = control.as_ref().ok_or("no HD60 S attached")?;
@@ -332,15 +212,10 @@ fn apply(shared: &Shared, request: &Request) -> Result<String, String> {
         control.set_colour_range(0)?;
         changed.push("reset".to_string());
     }
-    let wants_picture = ["brightness", "contrast", "saturation", "hue"]
-        .iter()
-        .any(|key| request.number(key).is_some());
-    if wants_picture {
+    const KEYS: [&str; 4] = ["brightness", "contrast", "saturation", "hue"];
+    if KEYS.iter().any(|key| request.number(key).is_some()) {
         let mut picture = control.settings()?.picture;
-        for (index, key) in ["brightness", "contrast", "saturation", "hue"]
-            .iter()
-            .enumerate()
-        {
+        for (index, key) in KEYS.iter().enumerate() {
             if let Some(value) = request.number(key) {
                 picture[index] = value;
                 changed.push(format!("{key}={value}"));
@@ -356,14 +231,9 @@ fn apply(shared: &Shared, request: &Request) -> Result<String, String> {
         control.set_audio_gain(gain)?;
         changed.push(format!("gain={gain}"));
     }
-    Ok(format!(
-        "{{\"ok\":true,\"changed\":{}}}",
-        json_string(&changed.join(" "))
-    ))
+    Ok(changed.join(" "))
 }
 
-/// Converts the latest 1920x1080 YUYV frame to a JPEG, at full size or
-/// reduced by an integer factor with a box filter (BT.709, limited range).
 fn preview(shared: &Shared, factor: usize, quality: u8) -> Option<Vec<u8>> {
     let frame = shared.latest.lock().unwrap().clone()?;
     jpeg_from_yuyv(&frame, factor, quality)
@@ -411,51 +281,6 @@ pub fn jpeg_from_yuyv(frame: &[u8], factor: usize, quality: u8) -> Option<Vec<u8
     Some(out)
 }
 
-/// The `Host` a browser may use to reach the panel: the bind address, or a
-/// loopback name with that port. Anything else is a DNS-rebinding attempt.
-pub(crate) fn host_allowed(request: &Request, bind: &str) -> bool {
-    let Some(host) = request.header("host") else {
-        return true;
-    };
-    if host == bind {
-        return true;
-    }
-    let port = bind.rsplit(':').next().unwrap_or("");
-    ["127.0.0.1", "localhost", "[::1]"]
-        .iter()
-        .any(|name| host == format!("{name}:{port}"))
-}
-
-/// Serves the same API on a Unix socket for programs of the same user
-/// (`hd60s-control`); the socket's permissions replace the token.
-pub fn run_unix(path: &std::path::Path, shared: Arc<Shared>) -> Result<(), String> {
-    use std::os::unix::fs::DirBuilderExt;
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
-    }
-    // Never take the socket from a live instance (a second `serve` would
-    // otherwise cut the first one off from its clients).
-    if std::os::unix::net::UnixStream::connect(path).is_ok() {
-        return Err(format!(
-            "another instance already serves {}; this one offers no API socket",
-            path.display()
-        ));
-    }
-    let _ = std::fs::remove_file(path);
-    let listener = std::os::unix::net::UnixListener::bind(path)
-        .map_err(|error| format!("binding the API socket {}: {error}", path.display()))?;
-    eprintln!("API socket at {}", path.display());
-    for stream in listener.incoming() {
-        if shared.stop.load(Ordering::Relaxed) {
-            break;
-        }
-        let Ok(stream) = stream else { continue };
-        let shared = shared.clone();
-        std::thread::spawn(move || handle(stream, shared, true));
-    }
-    Ok(())
-}
-
 /// One connection. `trusted` (the Unix socket) skips the token and the
 /// Host and Origin checks that protect the TCP port from browsers.
 fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>, trusted: bool) {
@@ -483,6 +308,11 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>, trusted: bool) {
         );
         return;
     }
+    // A change either succeeds with a message or fails with a reason.
+    let answer = |stream: &mut S, result: Result<String, String>| match result {
+        Ok(message) => respond_json(stream, "200 OK", &Outcome::ok(message)),
+        Err(error) => respond_json(stream, "500 Internal Server Error", &Outcome::error(error)),
+    };
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => respond(
             &mut stream,
@@ -490,19 +320,13 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>, trusted: bool) {
             "text/html; charset=utf-8",
             PAGE.replace("__TOKEN__", &shared.panel_token).as_bytes(),
         ),
-        ("GET", "/api/state") => respond(
-            &mut stream,
-            "200 OK",
-            "application/json",
-            state_json(&shared).as_bytes(),
-        ),
+        ("GET", "/api/state") => respond_json(&mut stream, "200 OK", &state(&shared)),
         ("POST", "/api/set") => match apply(&shared, &request) {
-            Ok(body) => respond(&mut stream, "200 OK", "application/json", body.as_bytes()),
-            Err(error) => respond(
+            Ok(changed) => respond_json(&mut stream, "200 OK", &Outcome::changed(changed)),
+            Err(error) => respond_json(
                 &mut stream,
                 "500 Internal Server Error",
-                "application/json",
-                format!("{{\"ok\":false,\"error\":{}}}", json_string(&error)).as_bytes(),
+                &Outcome::error(error),
             ),
         },
         ("POST", "/api/edid") => {
@@ -513,20 +337,7 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>, trusted: bool) {
             } else {
                 Err("nothing to do".into())
             };
-            match result {
-                Ok(message) => respond(
-                    &mut stream,
-                    "200 OK",
-                    "application/json",
-                    format!("{{\"ok\":true,\"message\":{}}}", json_string(&message)).as_bytes(),
-                ),
-                Err(error) => respond(
-                    &mut stream,
-                    "500 Internal Server Error",
-                    "application/json",
-                    format!("{{\"ok\":false,\"error\":{}}}", json_string(&error)).as_bytes(),
-                ),
-            }
+            answer(&mut stream, result);
         }
         ("POST", "/api/record") => {
             let result = if request.get("start").is_some() {
@@ -546,35 +357,16 @@ fn handle<S: Read + Write>(mut stream: S, shared: Arc<Shared>, trusted: bool) {
             } else {
                 Err("start=1 or stop=1".into())
             };
-            match result {
-                Ok(message) => respond(
-                    &mut stream,
-                    "200 OK",
-                    "application/json",
-                    format!("{{\"ok\":true,\"message\":{}}}", json_string(&message)).as_bytes(),
-                ),
-                Err(error) => respond(
-                    &mut stream,
-                    "500 Internal Server Error",
-                    "application/json",
-                    format!("{{\"ok\":false,\"error\":{}}}", json_string(&error)).as_bytes(),
-                ),
-            }
+            answer(&mut stream, result);
         }
         ("POST", "/api/stream") => {
             let on = request.get("on").is_some();
             shared.network_stream.store(on, Ordering::Relaxed);
             eprintln!("network stream switched {}", if on { "on" } else { "off" });
-            respond(
+            answer(
                 &mut stream,
-                "200 OK",
-                "application/json",
-                format!(
-                    "{{\"ok\":true,\"message\":\"network stream {}\"}}",
-                    if on { "on" } else { "off" }
-                )
-                .as_bytes(),
-            )
+                Ok(format!("network stream {}", if on { "on" } else { "off" })),
+            );
         }
         ("GET", "/edid.bin") => {
             let block = shared

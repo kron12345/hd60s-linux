@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::panel::{jpeg_from_yuyv, parse, respond};
+use crate::http::{parse, respond};
+use crate::panel::jpeg_from_yuyv;
 use crate::serve::Shared;
 
 const PAGE: &str = "<!doctype html><title>HD60 S stream</title><body style=\"margin:0;background:#000\"><img src=\"/stream.mjpg\" style=\"width:100%;height:100vh;object-fit:contain\">";

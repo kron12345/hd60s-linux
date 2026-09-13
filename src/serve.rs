@@ -228,7 +228,6 @@ impl Shared {
 /// Runs the camera and the audio source until the process is terminated.
 pub struct Options {
     pub panel: Option<String>,
-    pub tray: bool,
     pub record_dir: std::path::PathBuf,
     pub record_encoder: record::Encoder,
     /// Address for the MJPEG stream; `None` leaves the feature out.
@@ -243,7 +242,6 @@ pub struct Options {
 pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String> {
     let Options {
         panel,
-        tray,
         record_dir,
         record_encoder,
         stream_bind,
@@ -307,11 +305,6 @@ pub fn serve(name: &str, source: Source, options: Options) -> Result<(), String>
                 eprintln!("API socket: {error}");
             }
         });
-    }
-    if tray {
-        let tray_shared = shared.clone();
-        let url = panel.as_ref().map(|address| format!("http://{address}/"));
-        std::thread::spawn(move || crate::tray::run(tray_shared, url));
     }
 
     // Pump: device or file → shared state.

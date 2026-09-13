@@ -1,8 +1,10 @@
-pub mod client;
+pub mod config;
 pub mod control;
+pub mod ctl;
 pub mod device;
 pub mod edid;
 pub mod frame;
+pub mod http;
 pub mod panel;
 pub mod pump;
 pub mod record;
@@ -10,4 +12,3 @@ pub mod report;
 pub mod serve;
 pub mod stream;
 pub mod trace;
-pub mod tray;

@@ -4,10 +4,10 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use hd60s_api::{self as api, Command, State};
 use ksni::blocking::TrayMethods;
 use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Icon, ToolTip};
-use serde_json::Value;
 
 use crate::Runtime;
 
@@ -43,7 +43,7 @@ fn circle(size: i32, state: u8) -> Icon {
 }
 
 impl Tray {
-    pub fn apply(&mut self, state: Option<&Value>) {
+    pub fn apply(&mut self, state: Option<&State>) {
         match state {
             None => {
                 self.state = 0;
@@ -51,27 +51,25 @@ impl Tray {
                 self.recording = false;
             }
             Some(s) => {
-                let present = s["device"]["present"].as_bool().unwrap_or(false);
-                let signal = s["timing"]["present"].as_bool().unwrap_or(false);
-                self.state = match (present, signal) {
+                let signal = s.timing.as_ref().is_some_and(|t| t.present);
+                self.state = match (s.device.present, signal) {
                     (false, _) => 0,
                     (true, false) => 1,
                     (true, true) => 2,
                 };
-                self.recording = s["recording"].is_object();
-                self.muted = s["settings"]["gain"].as_i64() == Some(0);
-                let t = &s["timing"];
-                self.description = match self.state {
-                    0 => "no card on the bus".into(),
-                    1 => "card attached, no HDMI signal".into(),
-                    _ => format!(
+                self.recording = s.recording.is_some();
+                self.muted = s.settings.as_ref().is_some_and(|p| p.gain == 0);
+                self.description = match (self.state, &s.timing) {
+                    (2, Some(t)) => format!(
                         "{}x{} {} Hz · {:.1} fps{}",
-                        t["width"],
-                        t["height"],
-                        t["refresh"],
-                        s["stream"]["fps"].as_f64().unwrap_or(0.0),
+                        t.width,
+                        t.height,
+                        t.refresh,
+                        s.stream.fps,
                         if self.recording { " · ● REC" } else { "" }
                     ),
+                    (1, _) => "card attached, no HDMI signal".into(),
+                    _ => "no card on the bus".into(),
                 };
             }
         }
@@ -129,12 +127,11 @@ impl ksni::Tray for Tray {
                 .into(),
                 enabled: self.state == 2 || self.recording,
                 activate: Box::new(|tray: &mut Self| {
-                    let path = if tray.recording {
-                        "/api/record?stop=1"
+                    let _ = api::send(&if tray.recording {
+                        Command::RecordStop
                     } else {
-                        "/api/record?start=1"
-                    };
-                    let _ = crate::post(path);
+                        Command::RecordStart
+                    });
                 }),
                 ..Default::default()
             }),
@@ -147,11 +144,7 @@ impl ksni::Tray for Tray {
                 .into(),
                 enabled: self.state != 0,
                 activate: Box::new(|tray: &mut Self| {
-                    let _ = crate::post(if tray.muted {
-                        "/api/set?gain=128"
-                    } else {
-                        "/api/set?gain=0"
-                    });
+                    let _ = api::send(&Command::Gain(if tray.muted { 128 } else { 0 }));
                 }),
                 ..Default::default()
             }),

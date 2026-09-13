@@ -111,12 +111,12 @@ async function refresh(){
     const dev = s.device || {};
     $("devdot").className = "dot " + (dev.present ? (s.timing && s.timing.present ? "ok" : "warn") : "bad");
     $("devtext").textContent = dev.present ? `${dev.revision} · firmware ${dev.firmware} · MCU build ${dev.mcu_build} · ${dev.speed}` : (dev.error || "no device");
-    $("timing").textContent = s.timing ? (s.timing.text || s.timing.error) : "–";
+    $("timing").textContent = s.timing ? s.timing.text : (s.timing_error || "–");
     const st = s.stream || {};
     $("stream").textContent = `${st.present ? "streaming" : "waiting for the card"} · ${st.fps} fps · ${st.frames} frames · ${st.bad} bad · ${st.format_changes} format change(s) · source ${st.geometry[0]}x${st.geometry[1]} · up ${Math.round(st.uptime/60)} min`;
     if (dev.present) {
       kv($("device"), [["Revision", dev.revision],["Product ID", dev.product_id],["Firmware", dev.firmware],["MCU build", dev.mcu_build],["USB", `${dev.speed}, bus ${dev.bus} address ${dev.address}`]]);
-      if (s.settings && !s.settings.error) {
+      if (s.settings) {
         sliders.forEach((id,i) => { if (dragging !== id) { $(id).value = s.settings.picture[i]; $(id).nextElementSibling.textContent = s.settings.picture[i]; } });
         if (dragging !== "gain") { $("gain").value = s.settings.gain; $("gain").nextElementSibling.textContent = s.settings.gain_db.toFixed(1) + " dB"; }
         if (document.activeElement !== $("range")) $("range").value = s.settings.range;
@@ -124,7 +124,7 @@ async function refresh(){
     } else {
       kv($("device"), [["Status", dev.error || "not found"]]);
     }
-    if (s.edid) $("edid").textContent = s.edid.error || `${s.edid.summary} — ${s.edid.valid ? "valid" : "INVALID"}${s.edid.factory ? ", power-on block" : ", custom"}`;
+    if (s.edid || s.edid_error) $("edid").textContent = s.edid_error || `${s.edid.summary} — ${s.edid.valid ? "valid" : "INVALID"}${s.edid.factory ? ", power-on block" : ", custom"}`;
     if (s.mcu) kv($("mcu"), s.mcu.map(m => [`${m.command} ${m.meaning}`, `<span class="mono">${m.reply}</span>`]).concat([["read", `${s.snapshot_age} s ago, before the stream started`]]));
     if (s.message && s.message !== lastMessage) { lastMessage = s.message; setMsg(s.message); }
     recording = !!s.recording;
