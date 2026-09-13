@@ -575,6 +575,11 @@ fn main() -> Result<(), slint::PlatformError> {
             let mut tried_own = false;
             loop {
                 let result = state();
+                if result.is_ok() {
+                    // Should the service go away later (the unit disabled
+                    // from the Service box, say), run our own again.
+                    tried_own = false;
+                }
                 if result.is_err() && !tried_own && own.lock().unwrap().is_none() {
                     // Nothing answers: unless systemd is meant to run it, run it ourselves.
                     tried_own = true;
