@@ -8,4 +8,5 @@ license = "MIT"
 repository = "https://github.com/Hydrogen2K/hd60s-linux"
 
 [dependencies]
+memchr = "2.7"
 rusb = "0.9.4"

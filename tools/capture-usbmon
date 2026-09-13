@@ -20,11 +20,12 @@ command -v dumpcap >/dev/null || {
 device=''
 for candidate in /sys/bus/usb/devices/*; do
   [[ -r "$candidate/idVendor" && -r "$candidate/idProduct" ]] || continue
-  [[ "$(<"$candidate/idVendor")" == 0fd9 && "$(<"$candidate/idProduct")" == 005e ]] || continue
+  [[ "$(<"$candidate/idVendor")" == 0fd9 ]] || continue
+  case "$(<"$candidate/idProduct")" in 004f|005e|0074|0076) ;; *) continue ;; esac
   device="$candidate"
   break
 done
-[[ -n "$device" ]] || { echo 'error: HD60 S 0fd9:005e is not connected' >&2; exit 1; }
+[[ -n "$device" ]] || { echo 'error: no HD60 S (0fd9:004f/005e/0074/0076) is connected' >&2; exit 1; }
 
 readonly bus="$((10#$(<"$device/busnum")))"
 readonly address="$((10#$(<"$device/devnum")))"
